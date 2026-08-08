@@ -73,6 +73,54 @@ Bot akan connect ke Postgres pakai `DATABASE_URL` yang sudah tersambung.
 Kalau lupa link-nya, tinggal ketik `/link PROMO1` untuk dapat ulang tanpa
 perlu simpan ulang medianya.
 
+### Menyimpan banyak media sekaligus (album/batch) dalam 1 kode
+Kalau kamu kirim **beberapa foto/video sebagai 1 album** (dipilih sekaligus
+lalu dikirim bareng), bot otomatis merekam semua anggota album itu. Reply
+`/genlink KODE` ke **salah satu** foto di album tersebut — tidak perlu reply
+ke semuanya satu-satu:
+```
+/genlink LIBURAN1
+```
+Bot akan simpan semua foto/video di album itu di bawah 1 kode yang sama, dan
+saat user klik link-nya, semuanya dikirim sekaligus sebagai 1 album juga
+(lewat `send_media_group`). Kalau kamu reply ke foto/video tunggal (bukan
+bagian dari album), perilakunya sama seperti sebelumnya — cuma 1 media yang
+tersimpan.
+
+Catatan: buffer album ini cuma tersimpan di memori bot selama 5 menit sejak
+pesan pertama masuk, jadi jalankan `/genlink` tidak lama setelah kirim
+albumnya. Kalau bot baru saja restart tepat setelah kamu kirim album (misal
+karena redeploy), buffer-nya ikut hilang — kirim ulang albumnya kalau itu
+terjadi.
+
+### Menghapus media
+```
+/delmedia PROMO1
+```
+Menghapus media dengan kode itu dari database secara permanen. Setelah
+dihapus, link deep-link `?start=get_PROMO1` yang sudah pernah dibagikan
+tidak akan berfungsi lagi (user akan dapat pesan "konten tidak ditemukan").
+Khusus admin.
+
+### Menjelajah & cari media ("perpustakaan")
+Kalau sudah banyak kode yang tersimpan dan susah diingat-ingat:
+
+```
+/listmedia
+```
+Menampilkan daftar semua media (kode, jumlah item, cuplikan caption, link,
+tanggal upload), 10 per halaman, dengan tombol ⬅️/➡️ buat pindah halaman.
+Urutannya terbaru dulu.
+
+```
+/cari promo
+```
+Cari media yang kodenya **atau** caption-nya mengandung kata kunci itu
+(tidak case-sensitive), maksimal 20 hasil ditampilkan sekaligus. Berguna
+kalau lupa kode persisnya tapi ingat sepotong isi caption-nya.
+
+Keduanya khusus admin.
+
 ### Alur "upload video → posting link ke channel" (1 langkah)
 Ini alur yang biasanya kamu mau: upload video sekali ke bot, lalu
 **link-nya** (bukan videonya) yang muncul di channel, dibungkus tombol —
@@ -126,8 +174,8 @@ channel tanpa perlu akses dashboard Railway tiap saat.
 Saat user ketik `/` di chat bot, menu yang muncul otomatis berbeda:
 - **Member biasa** hanya melihat `/start` dan `/ping`.
 - **Admin** (sesuai `ADMIN_IDS`) melihat semua command: `/genlink`,
-  `/store`, `/link`, `/broadcast`, `/setvars`, `/delvars`, `/getvars`,
-  `/ping`, `/start`.
+  `/store`, `/link`, `/delmedia`, `/listmedia`, `/cari`, `/broadcast`,
+  `/setvars`, `/delvars`, `/getvars`, `/ping`, `/start`.
 
 Ini murni soal tampilan menu supaya rapi — semua command admin **tetap**
 dicek lewat `is_admin()` di kode, jadi member yang tahu nama command-nya
