@@ -73,6 +73,32 @@ Bot akan connect ke Postgres pakai `DATABASE_URL` yang sudah tersambung.
 Kalau lupa link-nya, tinggal ketik `/link PROMO1` untuk dapat ulang tanpa
 perlu simpan ulang medianya.
 
+### Alur "upload video → posting link ke channel" (1 langkah)
+Ini alur yang biasanya kamu mau: upload video sekali ke bot, lalu
+**link-nya** (bukan videonya) yang muncul di channel, dibungkus tombol —
+persis seperti contoh gambar "LENDIR GENZ" yang kamu kirim di awal.
+
+Reply video/foto yang mau kamu posting dengan:
+```
+/postlink PROMO1 🔥 Tonton Sekarang
+```
+
+Bot akan otomatis:
+1. Simpan videonya dengan kode `PROMO1` (sama seperti `/genlink`)
+2. Bikin deep link `https://t.me/NamaBot?start=get_PROMO1`
+3. Kirim pesan ke **semua channel/grup di `TARGET_CHATS`** berupa teks
+   (pakai caption video kalau ada, atau teks default) + **tombol**
+   `🔥 Tonton Sekarang` yang mengarah ke link itu
+
+Jadi yang tampil di channel cuma teks + tombol — bukan videonya. Orang
+yang klik tombol baru diarahkan ke bot, dicek wajib-join (kalau
+`REQUIRED_CHATS` diisi), baru videonya dikirim ke chat pribadi mereka.
+
+Kalau kamu mau posting ulang link yang **sama** ke channel lain tanpa
+upload ulang videonya, tinggal jalankan `/postlink PROMO1 🔥 Tonton
+Sekarang` lagi tanpa reply ke media apa pun — bot otomatis pakai video
+yang sudah tersimpan dengan kode itu.
+
 ### Mengatur TARGET_CHATS / REQUIRED_CHATS langsung dari chat
 Gak perlu lagi bolak-balik ke Railway Variables setiap mau ganti channel
 tujuan broadcast atau channel wajib-join — admin bisa atur langsung:

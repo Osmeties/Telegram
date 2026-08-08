@@ -67,6 +67,7 @@ PUBLIC_COMMANDS = [
 
 ADMIN_COMMANDS = PUBLIC_COMMANDS + [
     BotCommand("genlink", "Untuk membuat link fsub / konten"),
+    BotCommand("postlink", "Upload media + langsung posting link ke channel"),
     BotCommand("store", "Alias dari /genlink"),
     BotCommand("link", "Ambil ulang link dari kode yang sudah ada"),
     BotCommand("setvars", "Untuk mengatur variabel"),
@@ -227,12 +228,14 @@ async def check_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ---------------------------------------------------------------------
 async def store(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+    cmd = update.message.text.split()[0].lstrip("/").split("@")[0]  # "store" atau "genlink"
+
     if not is_admin(user.id):
         await update.message.reply_text("Perintah ini khusus admin.")
         return
 
     if not context.args:
-        await update.message.reply_text("Format: /store <kode>  (reply ke media)")
+        await update.message.reply_text(f"Format: /{cmd} <kode>  (reply ke media)")
         return
 
     code = context.args[0]
@@ -265,6 +268,86 @@ async def store(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(
         f"Tersimpan dengan kode: {code}\nLink siap pakai:\n{deep_link}"
+    )
+
+
+# ---------------------------------------------------------------------
+# /postlink <kode> <teks tombol>  (reply ke media)
+# Upload media + langsung posting ke TARGET_CHATS dalam bentuk pesan
+# bertombol yang mengarah ke deep link bot. Ini gabungan /genlink + /broadcast
+# supaya alur "upload video -> post link di channel" bisa 1 langkah.
+# ---------------------------------------------------------------------
+async def postlink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Perintah ini khusus admin.")
+        return
+
+    parts = update.message.text.split(None, 2)  # ["/postlink", "kode", "teks tombol..."]
+    if len(parts) < 3:
+        await update.message.reply_text(
+            "Format: /postlink <kode> <teks tombol>  (reply ke media)\n\n"
+            "Contoh:\n"
+            "/postlink PROMO1 🔥 Tonton Sekarang\n\n"
+            "Kalau kode-nya sudah pernah dipakai sebelumnya (medianya sudah "
+            "tersimpan), tidak perlu reply media lagi — command ini akan "
+            "langsung posting link yang sudah ada."
+        )
+        return
+
+    code = parts[1]
+    button_label = parts[2].strip()
+    replied = update.message.reply_to_message
+    caption = None
+
+    if replied is not None:
+        if replied.photo:
+            file_id, media_type = replied.photo[-1].file_id, "photo"
+        elif replied.video:
+            file_id, media_type = replied.video.file_id, "video"
+        elif replied.document:
+            file_id, media_type = replied.document.file_id, "document"
+        elif replied.animation:
+            file_id, media_type = replied.animation.file_id, "animation"
+        else:
+            file_id = media_type = None
+
+        if media_type:
+            caption = replied.caption or ""
+            await db.save_media(code, file_id, media_type, caption)
+
+    if await db.get_media(code) is None:
+        await update.message.reply_text(
+            "Kode ini belum punya media tersimpan. Reply command ini ke "
+            "foto/video/dokumen yang mau diposting, atau simpan dulu lewat "
+            "/genlink."
+        )
+        return
+
+    bot_username = (await context.bot.get_me()).username
+    deep_link = f"https://t.me/{bot_username}?start=get_{code}"
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(button_label, url=deep_link)]])
+    post_text = caption or "🎬 Konten baru sudah tersedia! Klik tombol di bawah untuk menonton."
+
+    target_chats = await get_target_chats()
+    if not target_chats:
+        await update.message.reply_text(
+            "⚠️ TARGET_CHATS masih kosong, jadi tidak ada channel/grup tujuan.\n"
+            "Isi dulu lewat /setvars TARGET_CHATS <chat_id> sebelum posting."
+        )
+        return
+
+    sent, failed = 0, 0
+    for chat_id in target_chats:
+        try:
+            await context.bot.send_message(chat_id, post_text, reply_markup=keyboard)
+            sent += 1
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Gagal posting ke %s: %s", chat_id, e)
+            failed += 1
+
+    await update.message.reply_text(
+        f"✅ Posting selesai. Sukses: {sent}, Gagal: {failed}\n\nLink: {deep_link}"
     )
 
 
@@ -459,6 +542,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CommandHandler(["store", "genlink"], store))
+    app.add_handler(CommandHandler("postlink", postlink))
     app.add_handler(CommandHandler("link", link))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("setvars", setvars))
