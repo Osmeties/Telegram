@@ -27,6 +27,7 @@ jadi tidak bisa "ditembus" walau seseorang tahu nama command-nya.
 Semua data (media & settings) disimpan di PostgreSQL (Railway) lewat db.py.
 """
 
+import html
 import json
 import logging
 import time
@@ -37,6 +38,9 @@ from telegram import (
     BotCommandScopeDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaDocument,
+    InputMediaPhoto,
+    InputMediaVideo,
     Update,
 )
 from telegram.constants import ParseMode
@@ -46,6 +50,8 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 import db
@@ -70,6 +76,9 @@ ADMIN_COMMANDS = PUBLIC_COMMANDS + [
     BotCommand("postlink", "Upload media + langsung posting link ke channel"),
     BotCommand("store", "Alias dari /genlink"),
     BotCommand("link", "Ambil ulang link dari kode yang sudah ada"),
+    BotCommand("delmedia", "Hapus media tersimpan berdasarkan kode"),
+    BotCommand("listmedia", "Lihat daftar semua media tersimpan"),
+    BotCommand("cari", "Cari media berdasarkan kode/caption"),
     BotCommand("setvars", "Untuk mengatur variabel"),
     BotCommand("delvars", "Untuk menghapus variabel"),
     BotCommand("getvars", "Untuk mendapatkan daftar variabel"),
@@ -136,6 +145,74 @@ def build_join_keyboard(missing: list[dict], code: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+# ---------------------------------------------------------------------
+# Dukungan batch/album: kalau admin kirim beberapa foto/video sekaligus
+# sebagai 1 album, Telegram mengirimnya sebagai pesan terpisah yang cuma
+# ditandai media_group_id yang sama — reply command cuma nempel ke 1 dari
+# pesan itu. Jadi kita "rekam" tiap pesan album yang masuk di sini, supaya
+# /store, /genlink, /postlink bisa ambil semua anggotanya sekaligus.
+# ---------------------------------------------------------------------
+MEDIA_GROUP_TTL = 300  # detik; buffer lama otomatis dibuang biar tidak numpuk
+
+
+def extract_media(message) -> tuple[str | None, str | None]:
+    """Ambil (file_id, media_type) dari 1 Message, atau (None, None) kalau
+    tipenya tidak didukung."""
+    if message.photo:
+        return message.photo[-1].file_id, "photo"
+    if message.video:
+        return message.video.file_id, "video"
+    if message.document:
+        return message.document.file_id, "document"
+    if message.animation:
+        return message.animation.file_id, "animation"
+    return None, None
+
+
+async def capture_album(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Rekam tiap pesan media dari admin yang merupakan bagian dari album
+    (media_group_id sama) ke buffer sementara di bot_data."""
+    message = update.message
+    if message is None or message.media_group_id is None:
+        return
+    if not is_admin(message.from_user.id):
+        return
+
+    file_id, media_type = extract_media(message)
+    if file_id is None:
+        return
+
+    groups = context.bot_data.setdefault("media_groups", {})
+
+    now = time.time()
+    for gid in [g for g, v in groups.items() if now - v["ts"] > MEDIA_GROUP_TTL]:
+        del groups[gid]
+
+    group = groups.setdefault(message.media_group_id, {"items": [], "caption": None, "ts": now})
+    group["items"].append({"file_id": file_id, "media_type": media_type})
+    group["ts"] = now
+    if message.caption:
+        group["caption"] = message.caption
+
+
+def get_replied_media_items(replied, context: ContextTypes.DEFAULT_TYPE) -> tuple[list[dict], str]:
+    """Kalau pesan yang di-reply itu bagian dari album yang sudah tertangkap
+    capture_album, kembalikan SEMUA anggota album itu. Kalau bukan album (atau
+    belum tertangkap), kembalikan 1 item dari pesan itu sendiri saja.
+    Return (items, caption)."""
+    if replied.media_group_id:
+        groups = context.bot_data.get("media_groups", {})
+        group = groups.get(replied.media_group_id)
+        if group and group["items"]:
+            caption = group["caption"] or (replied.caption or "")
+            return group["items"], caption
+
+    file_id, media_type = extract_media(replied)
+    if file_id is None:
+        return [], ""
+    return [{"file_id": file_id, "media_type": media_type}], (replied.caption or "")
+
+
 async def deliver_media(chat_id: int, code: str, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Kirim media untuk kode tsb. Return True kalau berhasil ketemu & terkirim."""
     row = await db.get_media(code)
@@ -143,19 +220,55 @@ async def deliver_media(chat_id: int, code: str, context: ContextTypes.DEFAULT_T
         await context.bot.send_message(chat_id, "Maaf, konten tidak ditemukan atau sudah kedaluwarsa.")
         return False
 
-    file_id, media_type, caption = row
+    items, caption = row["items"], row["caption"]
+
     send_map = {
         "photo": context.bot.send_photo,
         "video": context.bot.send_video,
         "document": context.bot.send_document,
         "animation": context.bot.send_animation,
     }
-    sender = send_map.get(media_type)
-    if sender is None:
-        await context.bot.send_message(chat_id, "Tipe media tidak didukung.")
-        return False
 
-    await sender(chat_id=chat_id, **{media_type: file_id}, caption=caption)
+    # 1 media -> kirim seperti biasa.
+    if len(items) == 1:
+        media_type = items[0]["media_type"]
+        sender = send_map.get(media_type)
+        if sender is None:
+            await context.bot.send_message(chat_id, "Tipe media tidak didukung.")
+            return False
+        await sender(chat_id=chat_id, **{media_type: items[0]["file_id"]}, caption=caption)
+        return True
+
+    # Lebih dari 1 media -> coba kirim sebagai 1 album (media group).
+    # Catatan: Telegram cuma izinkan photo/video/document dicampur dalam 1
+    # media group, "animation" (GIF) tidak bisa ikut di sana.
+    media_input_map = {
+        "photo": InputMediaPhoto,
+        "video": InputMediaVideo,
+        "document": InputMediaDocument,
+    }
+    if all(item["media_type"] in media_input_map for item in items):
+        media_group = [
+            media_input_map[item["media_type"]](
+                media=item["file_id"],
+                caption=caption if i == 0 else None,  # caption cuma boleh di item pertama
+            )
+            for i, item in enumerate(items)
+        ]
+        await context.bot.send_media_group(chat_id=chat_id, media=media_group)
+        return True
+
+    # Fallback: ada tipe yang tidak didukung media group (misal ada GIF
+    # tercampur di dalamnya) -> kirim satu-satu.
+    for i, item in enumerate(items):
+        sender = send_map.get(item["media_type"])
+        if sender is None:
+            continue
+        await sender(
+            chat_id=chat_id,
+            **{item["media_type"]: item["file_id"]},
+            caption=caption if i == 0 else None,
+        )
     return True
 
 
@@ -244,30 +357,19 @@ async def store(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Reply perintah ini ke pesan media yang ingin disimpan.")
         return
 
-    if replied.photo:
-        file_id = replied.photo[-1].file_id
-        media_type = "photo"
-    elif replied.video:
-        file_id = replied.video.file_id
-        media_type = "video"
-    elif replied.document:
-        file_id = replied.document.file_id
-        media_type = "document"
-    elif replied.animation:
-        file_id = replied.animation.file_id
-        media_type = "animation"
-    else:
+    items, caption = get_replied_media_items(replied, context)
+    if not items:
         await update.message.reply_text("Tipe media tidak didukung (gunakan foto/video/dokumen/gif).")
         return
 
-    caption = replied.caption or ""
-    await db.save_media(code, file_id, media_type, caption)
+    await db.save_media(code, items, caption)
 
     bot_username = (await context.bot.get_me()).username
     deep_link = f"https://t.me/{bot_username}?start=get_{code}"
 
+    jumlah = f" ({len(items)} media)" if len(items) > 1 else ""
     await update.message.reply_text(
-        f"Tersimpan dengan kode: {code}\nLink siap pakai:\n{deep_link}"
+        f"Tersimpan dengan kode: {code}{jumlah}\nLink siap pakai:\n{deep_link}"
     )
 
 
@@ -301,20 +403,10 @@ async def postlink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     caption = None
 
     if replied is not None:
-        if replied.photo:
-            file_id, media_type = replied.photo[-1].file_id, "photo"
-        elif replied.video:
-            file_id, media_type = replied.video.file_id, "video"
-        elif replied.document:
-            file_id, media_type = replied.document.file_id, "document"
-        elif replied.animation:
-            file_id, media_type = replied.animation.file_id, "animation"
-        else:
-            file_id = media_type = None
-
-        if media_type:
-            caption = replied.caption or ""
-            await db.save_media(code, file_id, media_type, caption)
+        items, cap = get_replied_media_items(replied, context)
+        if items:
+            caption = cap
+            await db.save_media(code, items, caption)
 
     if await db.get_media(code) is None:
         await update.message.reply_text(
@@ -364,6 +456,122 @@ async def link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     bot_username = (await context.bot.get_me()).username
     await update.message.reply_text(f"https://t.me/{bot_username}?start=get_{code}")
+
+
+# ---------------------------------------------------------------------
+# /delmedia <kode>  -> admin hapus media tersimpan
+# ---------------------------------------------------------------------
+async def delmedia(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Perintah ini khusus admin.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Format: /delmedia <kode>")
+        return
+
+    code = context.args[0]
+    deleted = await db.delete_media(code)
+
+    if deleted:
+        await update.message.reply_text(f"🗑️ Media dengan kode '{code}' berhasil dihapus.")
+    else:
+        await update.message.reply_text(f"Kode '{code}' tidak ditemukan (mungkin sudah terhapus).")
+
+
+# ---------------------------------------------------------------------
+# /listmedia [halaman] & /cari <kata kunci>  -> "perpustakaan" media
+# ---------------------------------------------------------------------
+MEDIA_PAGE_SIZE = 10
+
+
+def format_media_entry(row: dict, bot_username: str) -> str:
+    caption = (row["caption"] or "").strip().replace("\n", " ")
+    if len(caption) > 40:
+        caption = caption[:40] + "…"
+    caption = html.escape(caption)
+    code_display = html.escape(row["code"])
+    tanggal = row["created_at"].strftime("%d %b %Y")
+    jumlah = f"{row['item_count']} media" if row["item_count"] > 1 else "1 media"
+    link = f"https://t.me/{bot_username}?start=get_{row['code']}"
+    caption_part = f' — "{caption}"' if caption else ""
+    return f"🔑 <code>{code_display}</code> — {jumlah}{caption_part} ({tanggal})\n{link}"
+
+
+async def build_media_page(context: ContextTypes.DEFAULT_TYPE, page: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    total = await db.count_media()
+    if total == 0:
+        return "Belum ada media yang tersimpan.", None
+
+    total_pages = max(1, (total + MEDIA_PAGE_SIZE - 1) // MEDIA_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    rows = await db.list_media(offset=page * MEDIA_PAGE_SIZE, limit=MEDIA_PAGE_SIZE)
+
+    bot_username = (await context.bot.get_me()).username
+    body = "\n\n".join(format_media_entry(r, bot_username) for r in rows)
+    header = f"📚 Daftar media ({total} total) — halaman {page + 1}/{total_pages}\n\n"
+    text = header + body
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Sebelumnya", callback_data=f"listmedia_{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("Berikutnya ➡️", callback_data=f"listmedia_{page + 1}"))
+    keyboard = InlineKeyboardMarkup([nav]) if nav else None
+    return text, keyboard
+
+
+async def listmedia(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Perintah ini khusus admin.")
+        return
+
+    text, keyboard = await build_media_page(context, page=0)
+    await update.message.reply_text(
+        text, reply_markup=keyboard, parse_mode=ParseMode.HTML, disable_web_page_preview=True
+    )
+
+
+async def listmedia_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("Perintah ini khusus admin.", show_alert=True)
+        return
+    await query.answer()
+
+    page = int(query.data.split("_", 1)[1])
+    text, keyboard = await build_media_page(context, page=page)
+    await query.edit_message_text(
+        text, reply_markup=keyboard, parse_mode=ParseMode.HTML, disable_web_page_preview=True
+    )
+
+
+async def cari(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Perintah ini khusus admin.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Format: /cari <kata kunci>\nContoh: /cari promo1")
+        return
+
+    keyword = " ".join(context.args)
+    rows = await db.search_media(keyword, limit=20)
+    if not rows:
+        await update.message.reply_text(f"Tidak ada media yang cocok dengan '{keyword}'.")
+        return
+
+    bot_username = (await context.bot.get_me()).username
+    body = "\n\n".join(format_media_entry(r, bot_username) for r in rows)
+    suffix = " (maks 20 ditampilkan, persempit kata kuncinya kalau perlu)" if len(rows) == 20 else ""
+    header = f"🔍 Hasil untuk '{html.escape(keyword)}' — {len(rows)} ditemukan{suffix}\n\n"
+
+    await update.message.reply_text(
+        header + body, parse_mode=ParseMode.HTML, disable_web_page_preview=True
+    )
 
 
 # ---------------------------------------------------------------------
@@ -541,14 +749,25 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
+    app.add_handler(
+        MessageHandler(
+            filters.User(user_id=ADMIN_IDS)
+            & (filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.ANIMATION),
+            capture_album,
+        )
+    )
     app.add_handler(CommandHandler(["store", "genlink"], store))
     app.add_handler(CommandHandler("postlink", postlink))
     app.add_handler(CommandHandler("link", link))
+    app.add_handler(CommandHandler("delmedia", delmedia))
+    app.add_handler(CommandHandler("listmedia", listmedia))
+    app.add_handler(CommandHandler("cari", cari))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("setvars", setvars))
     app.add_handler(CommandHandler("delvars", delvars))
     app.add_handler(CommandHandler("getvars", getvars))
     app.add_handler(CallbackQueryHandler(check_join_callback, pattern=r"^checkjoin_"))
+    app.add_handler(CallbackQueryHandler(listmedia_callback, pattern=r"^listmedia_"))
 
     logger.info("Bot berjalan...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
