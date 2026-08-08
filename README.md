@@ -58,18 +58,58 @@ Bot akan connect ke Postgres pakai `DATABASE_URL` yang sudah tersambung.
 1. Kirim/forward media (foto/video/dokumen/gif) ke bot lewat chat pribadi.
 2. **Reply** media itu dengan:
    ```
-   /store PROMO1
+   /genlink PROMO1
    ```
+   (atau `/store PROMO1` — dua-duanya sama persis, `/genlink` cuma alias
+   yang lebih deskriptif)
 3. Bot akan balas dengan link siap-share, contoh:
    ```
    https://t.me/NamaBot?start=get_PROMO1
    ```
-4. Bagikan link itu di channel/caption postingan kamu (seperti contoh
-   tombol link di gambar yang kamu kirim). Siapa pun yang klik akan
-   otomatis menerima media itu di chat pribadi mereka.
+4. Bagikan link itu di channel/caption postingan kamu. Siapa pun yang
+   klik akan otomatis menerima media itu di chat pribadi mereka
+   (setelah lolos cek wajib-join, kalau diaktifkan).
 
 Kalau lupa link-nya, tinggal ketik `/link PROMO1` untuk dapat ulang tanpa
 perlu simpan ulang medianya.
+
+### Mengatur TARGET_CHATS / REQUIRED_CHATS langsung dari chat
+Gak perlu lagi bolak-balik ke Railway Variables setiap mau ganti channel
+tujuan broadcast atau channel wajib-join — admin bisa atur langsung:
+
+- **`/setvars <KEY> <value>`** — set/ganti nilai. Contoh:
+  ```
+  /setvars TARGET_CHATS -1001111111111,-1002222222222
+  ```
+  ```
+  /setvars REQUIRED_CHATS [{"chat_id": -1001111111111, "username": "namachannel", "invite_link": null, "label": "📢 Join Channel Utama"}]
+  ```
+- **`/delvars <KEY>`** — hapus nilai custom, balik pakai default dari
+  Railway Variables. Contoh: `/delvars TARGET_CHATS`
+- **`/getvars`** — lihat nilai yang sedang aktif sekarang (custom atau
+  default).
+
+Nilai dari `/setvars` disimpan di database dan **menimpa** nilai dari
+Railway Variables selama belum di-`/delvars`. Cocok buat ganti-ganti
+channel tanpa perlu akses dashboard Railway tiap saat.
+
+### Cek bot masih hidup
+`/ping` — bot balas dengan waktu respon dalam milidetik.
+
+### Menu command yang berbeda untuk admin & member
+Saat user ketik `/` di chat bot, menu yang muncul otomatis berbeda:
+- **Member biasa** hanya melihat `/start` dan `/ping`.
+- **Admin** (sesuai `ADMIN_IDS`) melihat semua command: `/genlink`,
+  `/store`, `/link`, `/broadcast`, `/setvars`, `/delvars`, `/getvars`,
+  `/ping`, `/start`.
+
+Ini murni soal tampilan menu supaya rapi — semua command admin **tetap**
+dicek lewat `is_admin()` di kode, jadi member yang tahu nama command-nya
+dan coba ketik manual tetap akan ditolak.
+
+Catatan: menu khusus admin baru bisa Telegram pasang kalau admin itu
+sudah pernah `/start` bot ini minimal sekali (batasan dari Telegram,
+bukan dari kode kita).
 
 ### Broadcast ke channel/grup
 1. Reply pesan yang ingin disebar (boleh teks atau media) dengan:

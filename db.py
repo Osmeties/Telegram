@@ -38,6 +38,15 @@ async def init_db() -> None:
             )
             """
         )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
 
 
 async def close_db() -> None:
@@ -72,3 +81,36 @@ async def get_media(code: str):
         if row is None:
             return None
         return row["file_id"], row["media_type"], row["caption"]
+
+
+# ---------------------------------------------------------------------
+# Settings (variabel yang bisa diatur admin lewat /setvars, /delvars, /getvars)
+# ---------------------------------------------------------------------
+async def get_setting(key: str) -> str | None:
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM settings WHERE key = $1", key)
+        return row["value"] if row else None
+
+
+async def set_setting(key: str, value: str) -> None:
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO settings (key, value, updated_at)
+            VALUES ($1, $2, now())
+            ON CONFLICT (key) DO UPDATE
+            SET value = EXCLUDED.value, updated_at = now()
+            """,
+            key, value,
+        )
+
+
+async def delete_setting(key: str) -> None:
+    async with _pool.acquire() as conn:
+        await conn.execute("DELETE FROM settings WHERE key = $1", key)
+
+
+async def get_all_settings() -> dict:
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("SELECT key, value FROM settings ORDER BY key")
+        return {r["key"]: r["value"] for r in rows}

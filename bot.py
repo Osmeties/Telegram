@@ -1,26 +1,44 @@
 """
-Bot Telegram: Broadcast + Kirim Media via Deep Link
-=====================================================
+Bot Telegram: Broadcast + Kirim Media via Deep Link + Wajib-Join
+==================================================================
 
 Fitur:
-1. /store  -> admin reply ke sebuah media (foto/video/dokumen) dengan
-              "/store <kode>" untuk menyimpan media itu dengan kode unik.
-2. /link   -> admin ketik "/link <kode>" untuk mendapatkan deep link
-              siap-pakai, contoh:
-              https://t.me/NamaBot?start=get_<kode>
-3. Saat user klik link tsb dan membuka bot (trigger command /start
-   dengan payload get_<kode>), bot otomatis mengirim media yang
-   tersimpan ke chat pribadi user.
-4. /broadcast -> admin reply ke sebuah pesan (teks/media) dengan
-              "/broadcast" untuk mengirim pesan itu ke semua channel/grup
-              yang terdaftar di daftar TARGET_CHATS (lihat config.py).
+1. /store atau /genlink -> admin reply ke sebuah media (foto/video/dokumen)
+              dengan "/store <kode>" untuk menyimpan media itu dengan kode
+              unik, sekaligus dapat deep link siap-pakai.
+2. /link   -> admin ketik "/link <kode>" untuk ambil ulang deep link
+              tanpa perlu simpan ulang medianya.
+3. Saat user klik deep link (payload get_<kode>), bot cek wajib-join
+   (REQUIRED_CHATS), lalu kirim media yang tersimpan ke chat pribadi user.
+4. /broadcast -> admin reply ke sebuah pesan (teks/media) untuk mengirim
+              pesan itu ke semua channel/grup di TARGET_CHATS.
+5. /setvars, /delvars, /getvars -> admin atur TARGET_CHATS & REQUIRED_CHATS
+              langsung dari chat, tanpa perlu ubah Railway Variables.
+              Nilai ini disimpan di database dan menimpa nilai default dari
+              config.py/Railway Variables selama belum dihapus (/delvars).
+6. /ping   -> cek bot masih hidup & seberapa cepat responnya.
 
-Semua data media disimpan di PostgreSQL (Railway) lewat modul db.py.
+Menu command yang muncul saat user ketik "/" DIBEDAKAN:
+- User biasa hanya melihat /start dan /ping.
+- Admin (ADMIN_IDS) melihat semua command di atas.
+Ini murni soal tampilan menu; command admin tetap dicek is_admin() di kode,
+jadi tidak bisa "ditembus" walau seseorang tahu nama command-nya.
+
+Semua data (media & settings) disimpan di PostgreSQL (Railway) lewat db.py.
 """
 
+import json
 import logging
+import time
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -39,18 +57,54 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Key yang boleh diatur lewat /setvars, /delvars, /getvars
+KNOWN_VAR_KEYS = ["TARGET_CHATS", "REQUIRED_CHATS"]
+
+PUBLIC_COMMANDS = [
+    BotCommand("start", "Mulai bot"),
+    BotCommand("ping", "Cek kecepatan respon bot"),
+]
+
+ADMIN_COMMANDS = PUBLIC_COMMANDS + [
+    BotCommand("genlink", "Untuk membuat link fsub / konten"),
+    BotCommand("store", "Alias dari /genlink"),
+    BotCommand("link", "Ambil ulang link dari kode yang sudah ada"),
+    BotCommand("setvars", "Untuk mengatur variabel"),
+    BotCommand("delvars", "Untuk menghapus variabel"),
+    BotCommand("getvars", "Untuk mendapatkan daftar variabel"),
+    BotCommand("broadcast", "Untuk mengirimkan pesan ke channel/grup"),
+]
+
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
 # ---------------------------------------------------------------------
+# Nilai efektif TARGET_CHATS / REQUIRED_CHATS (DB override > config/env)
+# ---------------------------------------------------------------------
+async def get_target_chats() -> list[int]:
+    val = await db.get_setting("TARGET_CHATS")
+    if val:
+        return [int(x) for x in val.split(",") if x.strip()]
+    return TARGET_CHATS
+
+
+async def get_required_chats() -> list[dict]:
+    val = await db.get_setting("REQUIRED_CHATS")
+    if val:
+        return json.loads(val)
+    return REQUIRED_CHATS
+
+
+# ---------------------------------------------------------------------
 # Cek wajib-join
 # ---------------------------------------------------------------------
 async def get_missing_chats(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> list[dict]:
-    """Kembalikan daftar REQUIRED_CHATS yang BELUM di-join user."""
+    """Kembalikan daftar REQUIRED_CHATS (efektif) yang BELUM di-join user."""
+    required = await get_required_chats()
     missing = []
-    for chat in REQUIRED_CHATS:
+    for chat in required:
         try:
             member = await context.bot.get_chat_member(chat["chat_id"], user_id)
             if member.status in ("left", "kicked"):
@@ -244,7 +298,8 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     sent, failed = 0, 0
-    for chat_id in TARGET_CHATS:
+    target_chats = await get_target_chats()
+    for chat_id in target_chats:
         try:
             await context.bot.copy_message(
                 chat_id=chat_id,
@@ -260,11 +315,132 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------
+# /setvars <KEY> <value>  -> admin atur TARGET_CHATS / REQUIRED_CHATS
+# ---------------------------------------------------------------------
+async def setvars(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Perintah ini khusus admin.")
+        return
+
+    parts = update.message.text.split(None, 2)  # ["/setvars", "KEY", "sisanya..."]
+    if len(parts) < 3:
+        await update.message.reply_text(
+            "Format: /setvars <KEY> <value>\n\n"
+            "Key yang didukung:\n\n"
+            "• TARGET_CHATS — daftar chat_id tujuan /broadcast, pisah koma\n"
+            "  Contoh:\n"
+            "  /setvars TARGET_CHATS -1001111111111,-1002222222222\n\n"
+            "• REQUIRED_CHATS — daftar channel/grup wajib-join, format JSON\n"
+            "  Contoh:\n"
+            '  /setvars REQUIRED_CHATS [{"chat_id": -1001111111111, '
+            '"username": "namachannel", "invite_link": null, '
+            '"label": "📢 Join Channel Utama"}]'
+        )
+        return
+
+    key = parts[1].upper()
+    value = parts[2].strip()
+
+    if key not in KNOWN_VAR_KEYS:
+        await update.message.reply_text(
+            f"Key '{key}' tidak dikenali. Gunakan salah satu: {', '.join(KNOWN_VAR_KEYS)}"
+        )
+        return
+
+    try:
+        if key == "TARGET_CHATS":
+            parsed = [int(x) for x in value.split(",") if x.strip()]
+            if not parsed:
+                raise ValueError("daftar kosong")
+        elif key == "REQUIRED_CHATS":
+            parsed = json.loads(value)
+            if not isinstance(parsed, list):
+                raise ValueError("harus berupa list JSON")
+    except Exception as e:  # noqa: BLE001
+        await update.message.reply_text(f"❌ Format value salah: {e}")
+        return
+
+    await db.set_setting(key, value)
+    await update.message.reply_text(f"✅ {key} berhasil disimpan.")
+
+
+# ---------------------------------------------------------------------
+# /delvars <KEY>  -> hapus override, balik ke default Railway Variables
+# ---------------------------------------------------------------------
+async def delvars(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Perintah ini khusus admin.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            f"Format: /delvars <KEY>\nKey yang didukung: {', '.join(KNOWN_VAR_KEYS)}"
+        )
+        return
+
+    key = context.args[0].upper()
+    await db.delete_setting(key)
+    await update.message.reply_text(
+        f"🗑️ {key} dihapus. Bot akan pakai nilai default dari Railway Variables lagi."
+    )
+
+
+# ---------------------------------------------------------------------
+# /getvars  -> lihat nilai efektif TARGET_CHATS & REQUIRED_CHATS saat ini
+# ---------------------------------------------------------------------
+async def getvars(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Perintah ini khusus admin.")
+        return
+
+    settings = await db.get_all_settings()
+    lines = ["📋 Variabel aktif saat ini:\n"]
+    for key in KNOWN_VAR_KEYS:
+        if key in settings:
+            lines.append(f"• {key} (diset via /setvars):\n{settings[key]}\n")
+        else:
+            default_val = TARGET_CHATS if key == "TARGET_CHATS" else REQUIRED_CHATS
+            lines.append(f"• {key} (default dari Railway Variables):\n{default_val}\n")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+# ---------------------------------------------------------------------
+# /ping  -> cek bot hidup + latency
+# ---------------------------------------------------------------------
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    t0 = time.monotonic()
+    msg = await update.message.reply_text("🏓 Pong...")
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    await msg.edit_text(f"🏓 Pong! {elapsed_ms:.0f}ms")
+
+
+# ---------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------
 async def post_init(application: Application) -> None:
     await db.init_db()
     logger.info("Koneksi database Postgres siap.")
+
+    # Menu command default: yang dilihat SEMUA orang (member biasa)
+    await application.bot.set_my_commands(
+        PUBLIC_COMMANDS, scope=BotCommandScopeDefault()
+    )
+
+    # Menu command khusus tiap admin: lihat semua command
+    for admin_id in ADMIN_IDS:
+        try:
+            await application.bot.set_my_commands(
+                ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=admin_id)
+            )
+        except TelegramError as e:
+            # Wajar gagal kalau admin itu belum pernah /start bot ini sama sekali
+            logger.warning("Gagal set menu admin untuk %s: %s", admin_id, e)
+
+    logger.info("Menu command terpasang.")
 
 
 async def post_shutdown(application: Application) -> None:
@@ -281,9 +457,13 @@ def main() -> None:
     )
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("store", store))
+    app.add_handler(CommandHandler("ping", ping))
+    app.add_handler(CommandHandler(["store", "genlink"], store))
     app.add_handler(CommandHandler("link", link))
     app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("setvars", setvars))
+    app.add_handler(CommandHandler("delvars", delvars))
+    app.add_handler(CommandHandler("getvars", getvars))
     app.add_handler(CallbackQueryHandler(check_join_callback, pattern=r"^checkjoin_"))
 
     logger.info("Bot berjalan...")
