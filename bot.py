@@ -597,6 +597,63 @@ async def cari(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------------
 # /broadcast  (reply ke pesan yang mau disebar ke channel/grup terdaftar)
 # ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Parsing baris tombol utk /broadcast. Baris di paling bawah teks yang
+# formatnya "<label> | <url>" dijadikan tombol. Bisa lebih dari 1 baris
+# (jadi beberapa baris tombol bertumpuk), dan 1 baris bisa berisi lebih
+# dari 1 tombol sekaligus (dipisah "||", jadi sebaris/side-by-side).
+# Berhenti scan begitu ketemu baris yang bukan format tombol.
+# ---------------------------------------------------------------------
+MAX_BUTTON_ROWS = 3
+
+
+# Alias warna Indonesia & Inggris -> nilai resmi Bot API 9.4+ (primary/success/danger)
+BUTTON_STYLE_ALIASES = {
+    "biru": "primary", "blue": "primary", "primary": "primary",
+    "hijau": "success", "green": "success", "success": "success",
+    "merah": "danger", "red": "danger", "danger": "danger",
+}
+
+
+def parse_button_lines(lines: list[str]) -> tuple[int, list[list[InlineKeyboardButton]]]:
+    """Return (jumlah_baris_yang_dipertahankan_sbg_teks, rows_tombol).
+    Tiap segmen tombol: "<label> | <url>" atau "<label> | <url> | <warna>"
+    (warna: biru/hijau/merah, opsional — butuh Telegram client yang cukup baru,
+    kalau tidak didukung tombol tampil normal tanpa warna)."""
+    rows: list[list[InlineKeyboardButton]] = []
+    idx = len(lines)
+    while idx > 0 and len(rows) < MAX_BUTTON_ROWS:
+        line = lines[idx - 1]
+        if "|" not in line:
+            break
+        row: list[InlineKeyboardButton] = []
+        ok = True
+        for seg in (s.strip() for s in line.split("||")):
+            parts = [p.strip() for p in seg.split("|")]
+            if len(parts) < 2 or len(parts) > 3:
+                ok = False
+                break
+            label, url = parts[0], parts[1]
+            if not label or not url.startswith(("http://", "https://", "tg://")):
+                ok = False
+                break
+            style = None
+            if len(parts) == 3 and parts[2]:
+                style = BUTTON_STYLE_ALIASES.get(parts[2].lower())
+                if style is None:
+                    ok = False
+                    break
+            kwargs = {"url": url}
+            if style:
+                kwargs["style"] = style
+            row.append(InlineKeyboardButton(label, **kwargs))
+        if not ok or not row:
+            break
+        rows.insert(0, row)
+        idx -= 1
+    return idx, rows
+
+
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not is_admin(user.id):
@@ -616,20 +673,25 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     plain_lines = (plain_parts[1] if len(plain_parts) > 1 else "").rstrip().splitlines()
     md_lines = (md_parts[1] if len(md_parts) > 1 else "").rstrip().splitlines()
 
-    keyboard = None
-    if plain_lines and "|" in plain_lines[-1]:
-        label, _, url = plain_lines[-1].partition("|")
-        label, url = label.strip(), url.strip()
-        if not label or not url.startswith(("http://", "https://", "tg://")):
-            await update.message.reply_text(
-                "Format tombol salah. Pastikan baris terakhir:\n"
-                "<teks tombol> | <url yang valid, diawali http/https>"
-            )
-            return
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(label, url=url)]])
-        plain_lines = plain_lines[:-1]
-        if len(md_lines) == len(plain_lines) + 1:
-            md_lines = md_lines[:-1]  # buang baris tombol juga dari versi markdown
+    keep_idx, button_rows = parse_button_lines(plain_lines)
+
+    if not button_rows and plain_lines and "|" in plain_lines[-1]:
+        # baris terakhir ADA "|" (jelas maksudnya mau bikin tombol) tapi
+        # format/URL-nya tidak valid -> kasih tahu, jangan diam-diam
+        # dianggap teks biasa.
+        await update.message.reply_text(
+            "Format tombol salah. Pastikan tiap baris tombol:\n"
+            "<teks tombol> | <url yang valid, diawali http/https>\n"
+            "atau dengan warna: <teks tombol> | <url> | <biru/hijau/merah>\n"
+            "(pisahkan dengan || kalau mau beberapa tombol sebaris)"
+        )
+        return
+
+    removed_count = len(plain_lines) - keep_idx
+    keyboard = InlineKeyboardMarkup(button_rows) if button_rows else None
+    plain_lines = plain_lines[:keep_idx]
+    if len(md_lines) == len(plain_lines) + removed_count:
+        md_lines = md_lines[: len(md_lines) - removed_count] if removed_count else md_lines
 
     custom_text = "\n".join(md_lines).strip()
 
