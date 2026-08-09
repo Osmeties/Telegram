@@ -186,12 +186,37 @@ sudah pernah `/start` bot ini minimal sekali (batasan dari Telegram,
 bukan dari kode kita).
 
 ### Broadcast ke channel/grup
-1. Reply pesan yang ingin disebar (boleh teks atau media) dengan:
-   ```
-   /broadcast
-   ```
-2. Bot akan mengirim salinan pesan itu ke semua `chat_id` yang ada di
-   `TARGET_CHATS`, dan melaporkan berapa yang berhasil/gagal.
+**Mode 1 — copy pesan yang sudah ada** (cocok kalau ada media/video):
+```
+/broadcast
+```
+Reply ke pesan yang ingin disebar (teks atau media). Bot mengirim salinannya
+ke semua `chat_id` di `TARGET_CHATS`.
+
+**Mode 2 — tulis langsung, tanpa reply** (cocok buat postingan teks promosi):
+Ketik `/broadcast` diikuti isi postingan di baris-baris berikutnya — boleh
+multi-baris, bold/underline dari toolbar Telegram tetap kepakai. Contoh:
+```
+/broadcast Judul Film
+
+👉 Cara Menonton 👈
+Tekan tombol Putar Video dibawah
+
+Jangan Lupa
+Subscribe dan Join Channel Dan Group Kami
+Untuk Update Konten Kami Lainnya 🙏
+
+▶️ Putar Video | https://t.me/NamaBot?start=get_KODE
+```
+Baris **terakhir** kalau formatnya `<teks tombol> | <url>` (URL wajib diawali
+`http://`, `https://`, atau `tg://`) otomatis diubah jadi tombol inline, tidak
+ikut tampil sebagai teks/link telanjang di postingan.
+
+Catatan: mode 2 tidak bisa membawa media (foto/video) karena tidak ada pesan
+yang di-reply — kalau butuh media, pakai Mode 1 lalu tambahkan baris tombol
+yang sama di akhir command `/broadcast`-nya (reply + tulis caption baru +
+baris tombol sekaligus, caption pesan asli akan ditimpa oleh caption baru
+ini).
 
 ### Alur wajib-join
 1. User klik link `?start=get_KODE`.
