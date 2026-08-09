@@ -66,6 +66,17 @@ async def init_db() -> None:
             )
             """
         )
+        # Kuota harian utk /cari (dihitung per hari kalender WIB, direset di bot.py)
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS search_usage (
+                user_id BIGINT NOT NULL,
+                day DATE NOT NULL,
+                count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, day)
+            )
+            """
+        )
 
 
 async def close_db() -> None:
@@ -161,6 +172,31 @@ async def search_media(keyword: str, limit: int = 20) -> list[dict]:
             keyword, limit,
         )
         return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------
+# Kuota harian /cari (member biasa dibatasi, admin tidak)
+# ---------------------------------------------------------------------
+async def get_search_count(user_id: int, day) -> int:
+    async with _pool.acquire() as conn:
+        val = await conn.fetchval(
+            "SELECT count FROM search_usage WHERE user_id = $1 AND day = $2",
+            user_id, day,
+        )
+        return val or 0
+
+
+async def increment_search_count(user_id: int, day) -> None:
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO search_usage (user_id, day, count)
+            VALUES ($1, $2, 1)
+            ON CONFLICT (user_id, day) DO UPDATE
+            SET count = search_usage.count + 1
+            """,
+            user_id, day,
+        )
 
 
 # ---------------------------------------------------------------------
