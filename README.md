@@ -212,6 +212,33 @@ Baris **terakhir** kalau formatnya `<teks tombol> | <url>` (URL wajib diawali
 `http://`, `https://`, atau `tg://`) otomatis diubah jadi tombol inline, tidak
 ikut tampil sebagai teks/link telanjang di postingan.
 
+**Beberapa tombol sekaligus** — tinggal tambah lebih dari 1 baris tombol di
+bagian bawah (maks 3 baris), tiap baris jadi 1 baris tombol:
+```
+🔴 Server 1 | https://t.me/NamaBot?start=get_s1
+🟢 Server 2 | https://t.me/NamaBot?start=get_s2
+🔵 Server 3 | https://t.me/NamaBot?start=get_s3
+```
+Atau kalau mau beberapa tombol **sebaris** (side-by-side, bukan bertumpuk),
+pisahkan dengan `||` dalam 1 baris:
+```
+▶️ Tonton | https://t.me/NamaBot?start=get_x || 📢 Join Channel | https://t.me/joinchannel
+```
+Dua cara ini bisa dikombinasikan (baris pertama 2 tombol pakai `||`, baris
+kedua di bawahnya 1 tombol, dst).
+
+**Warna tombol** — sejak Bot API 9.4 (Feb 2026), Telegram mendukung 3 warna
+preset untuk tombol: biru, hijau, merah (bukan warna bebas/HEX). Tambahkan
+sebagai segmen ke-3, dipisah `|` lagi:
+```
+📸 Photo 01~10 | https://t.me/NamaBot?start=get_s1 | hijau
+📸 Photo 11~20 | https://t.me/NamaBot?start=get_s2 | biru
+```
+Kata yang dikenali (tidak case-sensitive): `biru`/`blue`/`primary`,
+`hijau`/`green`/`success`, `merah`/`red`/`danger`. Butuh Telegram client yang
+sudah update — di client lama warnanya diabaikan (tombol tetap tampil,
+cuma jadi warna standar).
+
 Catatan: mode 2 tidak bisa membawa media (foto/video) karena tidak ada pesan
 yang di-reply — kalau butuh media, pakai Mode 1 lalu tambahkan baris tombol
 yang sama di akhir command `/broadcast`-nya (reply + tulis caption baru +
