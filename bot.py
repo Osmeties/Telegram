@@ -31,6 +31,7 @@ import html
 import json
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 
 from telegram import (
     BotCommand,
@@ -69,6 +70,7 @@ KNOWN_VAR_KEYS = ["TARGET_CHATS", "REQUIRED_CHATS"]
 PUBLIC_COMMANDS = [
     BotCommand("start", "Mulai bot"),
     BotCommand("ping", "Cek kecepatan respon bot"),
+    BotCommand("cari", "Cari media berdasarkan kode/caption (maks 3x/hari)"),
 ]
 
 ADMIN_COMMANDS = PUBLIC_COMMANDS + [
@@ -78,7 +80,6 @@ ADMIN_COMMANDS = PUBLIC_COMMANDS + [
     BotCommand("link", "Ambil ulang link dari kode yang sudah ada"),
     BotCommand("delmedia", "Hapus media tersimpan berdasarkan kode"),
     BotCommand("listmedia", "Lihat daftar semua media tersimpan"),
-    BotCommand("cari", "Cari media berdasarkan kode/caption"),
     BotCommand("setvars", "Untuk mengatur variabel"),
     BotCommand("delvars", "Untuk menghapus variabel"),
     BotCommand("getvars", "Untuk mendapatkan daftar variabel"),
@@ -484,6 +485,8 @@ async def delmedia(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # /listmedia [halaman] & /cari <kata kunci>  -> "perpustakaan" media
 # ---------------------------------------------------------------------
 MEDIA_PAGE_SIZE = 10
+DAILY_SEARCH_LIMIT = 3
+WIB = timezone(timedelta(hours=7))  # reset kuota /cari jam 00:00 WIB
 
 
 def format_media_entry(row: dict, bot_username: str) -> str:
@@ -550,9 +553,18 @@ async def listmedia_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def cari(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    if not is_admin(user.id):
-        await update.message.reply_text("Perintah ini khusus admin.")
-        return
+    admin = is_admin(user.id)
+    today = datetime.now(WIB).date()
+
+    used = 0
+    if not admin:
+        used = await db.get_search_count(user.id, today)
+        if used >= DAILY_SEARCH_LIMIT:
+            await update.message.reply_text(
+                f"⚠️ Kuota pencarian hari ini sudah habis ({DAILY_SEARCH_LIMIT}x/hari). "
+                "Coba lagi besok setelah jam 00:00 WIB."
+            )
+            return
 
     if not context.args:
         await update.message.reply_text("Format: /cari <kata kunci>\nContoh: /cari promo1")
@@ -560,8 +572,16 @@ async def cari(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     keyword = " ".join(context.args)
     rows = await db.search_media(keyword, limit=20)
+
+    if not admin:
+        await db.increment_search_count(user.id, today)
+        sisa = DAILY_SEARCH_LIMIT - (used + 1)
+        sisa_line = f"\n\n(sisa kuota pencarian hari ini: {sisa})"
+    else:
+        sisa_line = ""
+
     if not rows:
-        await update.message.reply_text(f"Tidak ada media yang cocok dengan '{keyword}'.")
+        await update.message.reply_text(f"Tidak ada media yang cocok dengan '{keyword}'.{sisa_line}")
         return
 
     bot_username = (await context.bot.get_me()).username
@@ -570,7 +590,7 @@ async def cari(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     header = f"🔍 Hasil untuk '{html.escape(keyword)}' — {len(rows)} ditemukan{suffix}\n\n"
 
     await update.message.reply_text(
-        header + body, parse_mode=ParseMode.HTML, disable_web_page_preview=True
+        header + body + sisa_line, parse_mode=ParseMode.HTML, disable_web_page_preview=True
     )
 
 
@@ -584,10 +604,70 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     replied = update.message.reply_to_message
+
+    # Ambil argumen setelah "/broadcast" dalam 2 bentuk: teks polos (buat cari
+    # baris tombol & validasi URL apa adanya) dan versi MarkdownV2 (biar
+    # bold/underline/dll dari toolbar Telegram tetap kepakai pas dikirim ulang).
+    plain_full = update.message.text or ""
+    md_full = update.message.text_markdown_v2 or plain_full
+
+    plain_parts = plain_full.split(None, 1)
+    md_parts = md_full.split(None, 1)
+    plain_lines = (plain_parts[1] if len(plain_parts) > 1 else "").rstrip().splitlines()
+    md_lines = (md_parts[1] if len(md_parts) > 1 else "").rstrip().splitlines()
+
+    keyboard = None
+    if plain_lines and "|" in plain_lines[-1]:
+        label, _, url = plain_lines[-1].partition("|")
+        label, url = label.strip(), url.strip()
+        if not label or not url.startswith(("http://", "https://", "tg://")):
+            await update.message.reply_text(
+                "Format tombol salah. Pastikan baris terakhir:\n"
+                "<teks tombol> | <url yang valid, diawali http/https>"
+            )
+            return
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(label, url=url)]])
+        plain_lines = plain_lines[:-1]
+        if len(md_lines) == len(plain_lines) + 1:
+            md_lines = md_lines[:-1]  # buang baris tombol juga dari versi markdown
+
+    custom_text = "\n".join(md_lines).strip()
+
     if replied is None:
-        await update.message.reply_text("Reply perintah ini ke pesan yang ingin di-broadcast.")
+        # Mode compose langsung: isi postingan diketik setelah /broadcast, tidak
+        # perlu reply ke pesan lain. Tidak bisa bawa media di mode ini.
+        if not custom_text:
+            await update.message.reply_text(
+                "Reply perintah ini ke pesan yang ingin di-broadcast (kalau ada media), "
+                "ATAU tulis langsung isi postingannya setelah /broadcast — boleh "
+                "multi-baris & pakai bold/underline dari toolbar Telegram.\n\n"
+                "Baris terakhir opsional buat tombol:\n<teks tombol> | <url>\n\n"
+                "Contoh:\n/broadcast Judul Film\n\nKlik tombol di bawah buat nonton.\n"
+                "▶️ Putar Video | https://t.me/NamaBot?start=get_KODE"
+            )
+            return
+
+        sent, failed = 0, 0
+        target_chats = await get_target_chats()
+        for chat_id in target_chats:
+            try:
+                await context.bot.send_message(
+                    chat_id,
+                    custom_text,
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=keyboard,
+                    disable_web_page_preview=True,
+                )
+                sent += 1
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Gagal broadcast ke %s: %s", chat_id, e)
+                failed += 1
+
+        await update.message.reply_text(f"Broadcast selesai. Sukses: {sent}, Gagal: {failed}")
         return
 
+    # Mode reply: copy pesan yang di-reply (bawa media kalau ada), opsional
+    # timpa caption-nya + pasang tombol dari argumen /broadcast di atas.
     sent, failed = 0, 0
     target_chats = await get_target_chats()
     for chat_id in target_chats:
@@ -596,6 +676,9 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 chat_id=chat_id,
                 from_chat_id=replied.chat_id,
                 message_id=replied.message_id,
+                caption=custom_text or None,
+                parse_mode=ParseMode.MARKDOWN_V2 if custom_text else None,
+                reply_markup=keyboard,
             )
             sent += 1
         except Exception as e:  # noqa: BLE001
