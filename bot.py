@@ -604,7 +604,7 @@ async def cari(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # dari 1 tombol sekaligus (dipisah "||", jadi sebaris/side-by-side).
 # Berhenti scan begitu ketemu baris yang bukan format tombol.
 # ---------------------------------------------------------------------
-MAX_BUTTON_ROWS = 3
+MAX_BUTTON_ROWS = 10
 
 
 # Alias warna Indonesia & Inggris -> nilai resmi Bot API 9.4+ (primary/success/danger)
