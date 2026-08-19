@@ -27,6 +27,7 @@ jadi tidak bisa "ditembus" walau seseorang tahu nama command-nya.
 Semua data (media & settings) disimpan di PostgreSQL (Railway) lewat db.py.
 """
 
+import asyncio
 import html
 import json
 import logging
@@ -45,7 +46,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ParseMode
-from telegram.error import TelegramError
+from telegram.error import RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -78,6 +79,10 @@ ADMIN_COMMANDS = PUBLIC_COMMANDS + [
     BotCommand("postlink", "Upload media + langsung posting link ke channel"),
     BotCommand("store", "Alias dari /genlink"),
     BotCommand("link", "Ambil ulang link dari kode yang sudah ada"),
+    BotCommand("batchstart", "Mulai kumpulkan banyak media (sampai ratusan) ke 1 kode"),
+    BotCommand("batchstatus", "Lihat jumlah media yang sudah terkumpul di batch"),
+    BotCommand("batchdone", "Selesaikan batch & simpan semua media ke kode"),
+    BotCommand("batchcancel", "Batalkan batch yang sedang berjalan"),
     BotCommand("delmedia", "Hapus media tersimpan berdasarkan kode"),
     BotCommand("listmedia", "Lihat daftar semua media tersimpan"),
     BotCommand("setvars", "Untuk mengatur variabel"),
@@ -152,8 +157,22 @@ def build_join_keyboard(missing: list[dict], code: str) -> InlineKeyboardMarkup:
 # ditandai media_group_id yang sama — reply command cuma nempel ke 1 dari
 # pesan itu. Jadi kita "rekam" tiap pesan album yang masuk di sini, supaya
 # /store, /genlink, /postlink bisa ambil semua anggotanya sekaligus.
+#
+# Catatan: Telegram sendiri MEMBATASI 1 album yang dikirim user ke maks 10
+# item per pesan album (batasan dari Telegram, bukan dari bot ini). Jadi
+# untuk kumpulkan lebih banyak dari itu (misal 200-300 media) di 1 kode,
+# dipakai sesi /batchstart di bawah: admin boleh kirim berkali-kali (album
+# demi album, atau satuan) sampai kode itu selesai lalu ditutup dengan
+# /batchdone.
 # ---------------------------------------------------------------------
 MEDIA_GROUP_TTL = 300  # detik; buffer lama otomatis dibuang biar tidak numpuk
+
+# Batas jumlah media per kode. Telegram mengirim media group maks 10 per
+# pesan, jadi angka besar di sini otomatis dipecah 10-10 saat dikirim
+# (lihat deliver_media). Angka ini cuma jaga-jaga supaya 1 kode tidak
+# kebablasan jadi ribuan item.
+MAX_BATCH_ITEMS = 300
+BATCH_SESSION_TTL = 3600  # detik; sesi /batchstart yang lupa ditutup otomatis basi setelah 1 jam
 
 
 def extract_media(message) -> tuple[str | None, str | None]:
@@ -170,13 +189,49 @@ def extract_media(message) -> tuple[str | None, str | None]:
     return None, None
 
 
-async def capture_album(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def get_batch_session(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> dict | None:
+    """Ambil sesi /batchstart aktif milik admin ini, atau None kalau tidak ada
+    / sudah basi (otomatis dibuang kalau basi)."""
+    sessions = context.bot_data.setdefault("batch_sessions", {})
+    session = sessions.get(user_id)
+    if session is None:
+        return None
+    if time.time() - session["ts"] > BATCH_SESSION_TTL:
+        del sessions[user_id]
+        return None
+    return session
+
+
+async def capture_batch_media(message, context: ContextTypes.DEFAULT_TYPE, session: dict) -> None:
+    """Tampung 1 pesan media ke sesi /batchstart yang sedang aktif -- ini
+    yang bikin 1 kode bisa punya ratusan item walau Telegram sendiri cuma
+    izinkan maks 10 item per pesan album."""
+    file_id, media_type = extract_media(message)
+    if file_id is None:
+        return
+
+    if len(session["items"]) >= MAX_BATCH_ITEMS:
+        # Cuma kasih tahu sekali biar tidak spam admin kalau dia masih
+        # ngirim lebih banyak lagi setelah limit tercapai.
+        if not session.get("limit_warned"):
+            session["limit_warned"] = True
+            await message.reply_text(
+                f"⚠️ Batch sudah mencapai batas {MAX_BATCH_ITEMS} media. "
+                "Media ini TIDAK ditambahkan. Jalankan /batchdone untuk "
+                "menyimpan yang sudah terkumpul."
+            )
+        return
+
+    session["items"].append({"file_id": file_id, "media_type": media_type})
+    session["ts"] = time.time()
+    if message.caption and not session["caption"]:
+        session["caption"] = message.caption
+
+
+def capture_album(message, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Rekam tiap pesan media dari admin yang merupakan bagian dari album
     (media_group_id sama) ke buffer sementara di bot_data."""
-    message = update.message
-    if message is None or message.media_group_id is None:
-        return
-    if not is_admin(message.from_user.id):
+    if message.media_group_id is None:
         return
 
     file_id, media_type = extract_media(message)
@@ -194,6 +249,129 @@ async def capture_album(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     group["ts"] = now
     if message.caption:
         group["caption"] = message.caption
+
+
+async def handle_admin_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Router untuk tiap pesan media yang masuk dari admin: kalau ada sesi
+    /batchstart aktif, tampung ke situ; kalau tidak, jalankan buffer album
+    biasa (dipakai /genlink, /store, /postlink)."""
+    message = update.message
+    if message is None:
+        return
+    user = message.from_user
+    if user is None or not is_admin(user.id):
+        return
+
+    session = get_batch_session(context, user.id)
+    if session is not None:
+        await capture_batch_media(message, context, session)
+        return
+
+    capture_album(message, context)
+
+
+# ---------------------------------------------------------------------
+# /batchstart, /batchstatus, /batchdone, /batchcancel
+# Alur kumpul media dalam jumlah besar (sampai MAX_BATCH_ITEMS) ke 1 kode,
+# lintas beberapa kali kirim (boleh campur album & satuan, boleh dari
+# beberapa kali forward), baru disimpan sekaligus lewat /batchdone.
+# ---------------------------------------------------------------------
+async def batchstart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Perintah ini khusus admin.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Format: /batchstart <kode>")
+        return
+
+    code = context.args[0]
+    sessions = context.bot_data.setdefault("batch_sessions", {})
+    if user.id in sessions:
+        await update.message.reply_text(
+            f"Sudah ada batch aktif untuk kode '{sessions[user.id]['code']}' "
+            f"({len(sessions[user.id]['items'])} media terkumpul).\n"
+            "Selesaikan dulu dengan /batchdone atau batalkan dengan /batchcancel "
+            "sebelum mulai batch baru."
+        )
+        return
+
+    sessions[user.id] = {"code": code, "items": [], "caption": None, "ts": time.time(), "limit_warned": False}
+    await update.message.reply_text(
+        f"📦 Batch dimulai untuk kode '{code}'.\n\n"
+        "Sekarang kirim/forward media (foto/video/dokumen/gif) ke bot ini "
+        "sebanyak yang kamu mau — boleh berkali-kali, boleh dalam bentuk "
+        f"album ataupun satuan, sampai maks {MAX_BATCH_ITEMS} media.\n\n"
+        "Cek progres dengan /batchstatus.\n"
+        "Setelah semua terkirim, tutup dengan /batchdone.\n"
+        f"(Batch otomatis basi kalau didiamkan lebih dari {BATCH_SESSION_TTL // 60} menit.)"
+    )
+
+
+async def batchstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Perintah ini khusus admin.")
+        return
+
+    session = get_batch_session(context, user.id)
+    if session is None:
+        await update.message.reply_text("Tidak ada batch aktif. Mulai dengan /batchstart <kode>.")
+        return
+
+    await update.message.reply_text(
+        f"📦 Batch '{session['code']}': {len(session['items'])} media terkumpul.\n"
+        "Kirim lagi kalau belum selesai, atau /batchdone untuk menyimpan."
+    )
+
+
+async def batchcancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Perintah ini khusus admin.")
+        return
+
+    sessions = context.bot_data.setdefault("batch_sessions", {})
+    session = sessions.pop(user.id, None)
+    if session is None:
+        await update.message.reply_text("Tidak ada batch aktif.")
+        return
+
+    await update.message.reply_text(
+        f"❌ Batch '{session['code']}' dibatalkan ({len(session['items'])} media dibuang, tidak disimpan)."
+    )
+
+
+async def batchdone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Perintah ini khusus admin.")
+        return
+
+    sessions = context.bot_data.setdefault("batch_sessions", {})
+    session = sessions.get(user.id)
+    if session is None:
+        await update.message.reply_text("Tidak ada batch aktif. Mulai dengan /batchstart <kode>.")
+        return
+
+    if not session["items"]:
+        del sessions[user.id]
+        await update.message.reply_text("Batch dibatalkan otomatis — tidak ada media yang terkumpul.")
+        return
+
+    code = session["code"]
+    await db.save_media(code, session["items"], session["caption"])
+    del sessions[user.id]
+
+    bot_username = (await context.bot.get_me()).username
+    deep_link = f"https://t.me/{bot_username}?start=get_{code}"
+    await update.message.reply_text(
+        f"✅ Batch selesai. Tersimpan {len(session['items'])} media dengan kode: {code}\n"
+        f"Link siap pakai:\n{deep_link}\n\n"
+        "(Saat dikirim ke user, otomatis dipecah jadi beberapa album 10-10 "
+        "karena batasan Telegram.)"
+    )
 
 
 def get_replied_media_items(replied, context: ContextTypes.DEFAULT_TYPE) -> tuple[list[dict], str]:
@@ -240,7 +418,9 @@ async def deliver_media(chat_id: int, code: str, context: ContextTypes.DEFAULT_T
         await sender(chat_id=chat_id, **{media_type: items[0]["file_id"]}, caption=caption)
         return True
 
-    # Lebih dari 1 media -> coba kirim sebagai 1 album (media group).
+    # Lebih dari 1 media -> kirim sebagai album (media group), dipecah
+    # 10-10 karena Telegram membatasi maks 10 item per pesan send_media_group
+    # (jadi 200-300 media otomatis jadi 20-30 pesan album berturutan).
     # Catatan: Telegram cuma izinkan photo/video/document dicampur dalam 1
     # media group, "animation" (GIF) tidak bisa ikut di sana.
     media_input_map = {
@@ -248,15 +428,32 @@ async def deliver_media(chat_id: int, code: str, context: ContextTypes.DEFAULT_T
         "video": InputMediaVideo,
         "document": InputMediaDocument,
     }
+    GROUP_CHUNK_SIZE = 10
+    DELAY_BETWEEN_CHUNKS = 1.5  # detik; jaga-jaga supaya tidak kena flood limit Telegram
+
     if all(item["media_type"] in media_input_map for item in items):
-        media_group = [
-            media_input_map[item["media_type"]](
-                media=item["file_id"],
-                caption=caption if i == 0 else None,  # caption cuma boleh di item pertama
-            )
-            for i, item in enumerate(items)
-        ]
-        await context.bot.send_media_group(chat_id=chat_id, media=media_group)
+        chunks = [items[i:i + GROUP_CHUNK_SIZE] for i in range(0, len(items), GROUP_CHUNK_SIZE)]
+        # send_media_group butuh minimal 2 item per pesan -- kalau potongan
+        # terakhir cuma nyisa 1 (misal total 11, 21, dst.), "pinjam" 1 item
+        # dari potongan sebelumnya (jadi 9 + 2) supaya tidak ada chunk
+        # ber-isi 1 ataupun yang kelebihan dari 10.
+        if len(chunks) > 1 and len(chunks[-1]) == 1:
+            chunks[-1].insert(0, chunks[-2].pop())
+
+        for chunk_idx, chunk in enumerate(chunks):
+            media_group = [
+                media_input_map[item["media_type"]](
+                    media=item["file_id"],
+                    # Caption cuma boleh nempel di 1 item -- taruh di item
+                    # pertama dari chunk pertama saja supaya tidak berulang
+                    # di tiap potongan album.
+                    caption=caption if (chunk_idx == 0 and i == 0) else None,
+                )
+                for i, item in enumerate(chunk)
+            ]
+            await send_media_group_with_retry(context, chat_id, media_group)
+            if chunk_idx < len(chunks) - 1:
+                await asyncio.sleep(DELAY_BETWEEN_CHUNKS)
         return True
 
     # Fallback: ada tipe yang tidak didukung media group (misal ada GIF
@@ -271,6 +468,17 @@ async def deliver_media(chat_id: int, code: str, context: ContextTypes.DEFAULT_T
             caption=caption if i == 0 else None,
         )
     return True
+
+
+async def send_media_group_with_retry(context: ContextTypes.DEFAULT_TYPE, chat_id: int, media_group: list) -> None:
+    """send_media_group, tapi kalau Telegram balas 'Too Many Requests'
+    (wajar kalau kirim puluhan album berturutan), tunggu sesuai retry_after
+    lalu coba lagi sekali."""
+    try:
+        await context.bot.send_media_group(chat_id=chat_id, media=media_group)
+    except RetryAfter as e:
+        await asyncio.sleep(e.retry_after + 1)
+        await context.bot.send_media_group(chat_id=chat_id, media=media_group)
 
 
 # ---------------------------------------------------------------------
@@ -894,16 +1102,17 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
-    app.add_handler(
-        MessageHandler(
-            filters.User(user_id=ADMIN_IDS)
-            & (filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.ANIMATION),
-            capture_album,
-        )
+    media_filter = filters.User(user_id=ADMIN_IDS) & (
+        filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.ANIMATION
     )
+    app.add_handler(MessageHandler(media_filter, handle_admin_media))
     app.add_handler(CommandHandler(["store", "genlink"], store))
     app.add_handler(CommandHandler("postlink", postlink))
     app.add_handler(CommandHandler("link", link))
+    app.add_handler(CommandHandler("batchstart", batchstart))
+    app.add_handler(CommandHandler("batchstatus", batchstatus))
+    app.add_handler(CommandHandler("batchdone", batchdone))
+    app.add_handler(CommandHandler("batchcancel", batchcancel))
     app.add_handler(CommandHandler("delmedia", delmedia))
     app.add_handler(CommandHandler("listmedia", listmedia))
     app.add_handler(CommandHandler("cari", cari))

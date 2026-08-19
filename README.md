@@ -93,6 +93,48 @@ albumnya. Kalau bot baru saja restart tepat setelah kamu kirim album (misal
 karena redeploy), buffer-nya ikut hilang — kirim ulang albumnya kalau itu
 terjadi.
 
+Catatan penting: Telegram sendiri membatasi 1 album yang kamu kirim ke bot
+maksimal **10 item per pesan** — ini batasan dari Telegram, bukan dari bot
+ini. Kalau mau simpan lebih banyak dari itu (sampai ratusan) di 1 kode yang
+sama, pakai `/batchstart` di bawah.
+
+### Menyimpan BANYAK media sekaligus (sampai ratusan) dalam 1 kode
+Kalau albummu lebih dari 10 media — misalnya mau kumpulkan 200-300 foto/video
+jadi 1 kode — pakai alur batch ini, bukan `/genlink` biasa:
+
+```
+/batchstart PROMO1
+```
+Setelah itu, kirim/forward medianya ke bot **sebanyak yang kamu mau**, boleh
+berkali-kali, boleh campur album (tiap album maks 10 karena batasan Telegram)
+maupun kiriman satuan — bot akan terus menampung semuanya ke kode `PROMO1`
+sampai kamu tutup sendiri, jadi total bisa jauh lebih dari 10.
+
+Cek progresnya kapan saja dengan:
+```
+/batchstatus
+```
+
+Kalau sudah semua terkirim, tutup dan simpan dengan:
+```
+/batchdone
+```
+Bot akan balas dengan link siap-share, sama seperti `/genlink`, plus jumlah
+total media yang tersimpan. Batal di tengah jalan? Pakai `/batchcancel`
+(tidak ada yang disimpan).
+
+Batas maksimal per kode adalah 300 media (bisa diubah lewat konstanta
+`MAX_BATCH_ITEMS` di `bot.py`), dan sesi batch otomatis basi kalau
+didiamkan lebih dari 1 jam sejak kiriman terakhir.
+
+Saat user klik link kode yang isinya banyak media begini, bot otomatis
+memecah pengirimannya jadi beberapa album berturutan, **10 media per album**
+(sesuai batas Telegram untuk `send_media_group`), dengan jeda singkat
+antar-album supaya tidak kena limit "Too Many Requests" dari Telegram.
+Jadi kode dengan 200 media misalnya akan sampai ke user sebagai ~20 pesan
+album beruntun, bukan 1 pesan raksasa (memang tidak bisa 1 pesan karena ini
+batasan Telegram, bukan bot).
+
 ### Menghapus media
 ```
 /delmedia PROMO1
@@ -174,7 +216,8 @@ channel tanpa perlu akses dashboard Railway tiap saat.
 Saat user ketik `/` di chat bot, menu yang muncul otomatis berbeda:
 - **Member biasa** hanya melihat `/start` dan `/ping`.
 - **Admin** (sesuai `ADMIN_IDS`) melihat semua command: `/genlink`,
-  `/store`, `/link`, `/delmedia`, `/listmedia`, `/cari`, `/broadcast`,
+  `/store`, `/link`, `/batchstart`, `/batchstatus`, `/batchdone`,
+  `/batchcancel`, `/delmedia`, `/listmedia`, `/cari`, `/broadcast`,
   `/setvars`, `/delvars`, `/getvars`, `/ping`, `/start`.
 
 Ini murni soal tampilan menu supaya rapi — semua command admin **tetap**
