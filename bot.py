@@ -33,6 +33,7 @@ import json
 import logging
 import time
 from datetime import datetime, timedelta, timezone
+from datetime import time as dt_time
 
 from telegram import (
     BotCommand,
@@ -392,14 +393,85 @@ def get_replied_media_items(replied, context: ContextTypes.DEFAULT_TYPE) -> tupl
     return [{"file_id": file_id, "media_type": media_type}], (replied.caption or "")
 
 
-async def deliver_media(chat_id: int, code: str, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Kirim media untuk kode tsb. Return True kalau berhasil ketemu & terkirim."""
+# ---------------------------------------------------------------------
+# Proteksi konten: media yang dikirim ke user (deliver_media) dipasangi
+# protect_content (Telegram menonaktifkan tombol forward & "Simpan ke
+# Galeri" di client -- ini fitur resmi Bot API 5.5+, bukan hack) dan
+# dijadwalkan otomatis terhapus dari chat setelah AUTO_DELETE_SECONDS.
+#
+# PENTING - batasannya, biar realistis:
+# - protect_content mencegah forward & simpan LEWAT TELEGRAM. Tidak
+#   mencegah screenshot atau screen-recording di device penerima.
+# - Auto-hapus butuh JobQueue (extra "python-telegram-bot[job-queue]" di
+#   requirements.txt). Kalau bot restart (misal redeploy Railway) SAAT
+#   masih dalam window 2 jam, jadwal hapus yang belum sempat jalan ikut
+#   hilang (media jadi tidak kehapus tepat waktu untuk kasus itu saja --
+#   bukan bug fatal, cuma keterbatasan JobQueue yang disimpan di memori).
+# ---------------------------------------------------------------------
+AUTO_DELETE_SECONDS = 2 * 60 * 60  # 2 jam
+PROTECT_CONTENT = True
+
+WIB = timezone(timedelta(hours=7))
+
+# Jendela waktu di mana media dikirim TANPA proteksi (boleh forward/simpan).
+# Ditentukan dari jam BOT MENGIRIM medianya, bukan jam user menontonnya --
+# sekali terkirim tanpa proteksi karena kebetulan dalam jendela ini,
+# statusnya "boleh forward" sampai auto-hapus 2 jam nanti, tidak berubah
+# lagi walau jam sudah lewat dari jendela. Auto-hapus 2 jam TETAP berjalan
+# biarpun dikirim di jendela ini (proteksi & auto-hapus itu 2 hal terpisah).
+UNLOCK_WINDOW_START = dt_time(20, 0)
+UNLOCK_WINDOW_END = dt_time(21, 0)
+
+
+def is_in_unlock_window() -> bool:
+    return UNLOCK_WINDOW_START <= datetime.now(WIB).time() < UNLOCK_WINDOW_END
+
+
+async def _delete_scheduled_message(context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = context.job.data
+    try:
+        await context.bot.delete_message(chat_id=data["chat_id"], message_id=data["message_id"])
+    except TelegramError as e:
+        # Wajar gagal kalau user sudah duluan hapus manual, atau blokir bot
+        logger.info("Auto-hapus dilewati utk pesan %s di %s: %s", data["message_id"], data["chat_id"], e)
+
+
+def schedule_auto_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_ids: list[int]) -> None:
+    if not message_ids:
+        return
+    if context.job_queue is None:
+        logger.warning(
+            "job_queue tidak aktif -- pastikan 'python-telegram-bot[job-queue]' "
+            "terpasang (lihat requirements.txt). Auto-hapus TIDAK berjalan kali ini."
+        )
+        return
+    for mid in message_ids:
+        context.job_queue.run_once(
+            _delete_scheduled_message,
+            when=AUTO_DELETE_SECONDS,
+            data={"chat_id": chat_id, "message_id": mid},
+            name=f"autodel_{chat_id}_{mid}",
+        )
+
+
+async def deliver_media(chat_id: int, code: str, context: ContextTypes.DEFAULT_TYPE, requester_id: int) -> bool:
+    """Kirim media untuk kode tsb. Return True kalau berhasil ketemu & terkirim.
+    Media diproteksi (protect_content, tidak bisa di-forward/disimpan) dan
+    otomatis dihapus setelah AUTO_DELETE_SECONDS -- KECUALI kalau yang minta
+    adalah admin (mis. lagi mendata/cek isi media, medianya tidak boleh
+    hilang sendiri)."""
     row = await db.get_media(code)
     if row is None:
         await context.bot.send_message(chat_id, "Maaf, konten tidak ditemukan atau sudah kedaluwarsa.")
         return False
 
     items, caption = row["items"], row["caption"]
+    sent_message_ids: list[int] = []
+    # Admin selalu bebas proteksi. Selain admin, proteksi dilewati kalau
+    # sedang di jendela waktu bebas (20:00-21:00 WIB) -- tapi auto-hapus
+    # 2 jam tetap jalan terlepas dari jendela ini.
+    protect = PROTECT_CONTENT and not is_admin(requester_id) and not is_in_unlock_window()
+    skip_notice = is_admin(requester_id)
 
     send_map = {
         "photo": context.bot.send_photo,
@@ -415,70 +487,108 @@ async def deliver_media(chat_id: int, code: str, context: ContextTypes.DEFAULT_T
         if sender is None:
             await context.bot.send_message(chat_id, "Tipe media tidak didukung.")
             return False
-        await sender(chat_id=chat_id, **{media_type: items[0]["file_id"]}, caption=caption)
-        return True
-
-    # Lebih dari 1 media -> kirim sebagai album (media group), dipecah
-    # 10-10 karena Telegram membatasi maks 10 item per pesan send_media_group
-    # (jadi 200-300 media otomatis jadi 20-30 pesan album berturutan).
-    # Catatan: Telegram cuma izinkan photo/video/document dicampur dalam 1
-    # media group, "animation" (GIF) tidak bisa ikut di sana.
-    media_input_map = {
-        "photo": InputMediaPhoto,
-        "video": InputMediaVideo,
-        "document": InputMediaDocument,
-    }
-    GROUP_CHUNK_SIZE = 10
-    DELAY_BETWEEN_CHUNKS = 1.5  # detik; jaga-jaga supaya tidak kena flood limit Telegram
-
-    if all(item["media_type"] in media_input_map for item in items):
-        chunks = [items[i:i + GROUP_CHUNK_SIZE] for i in range(0, len(items), GROUP_CHUNK_SIZE)]
-        # send_media_group butuh minimal 2 item per pesan -- kalau potongan
-        # terakhir cuma nyisa 1 (misal total 11, 21, dst.), "pinjam" 1 item
-        # dari potongan sebelumnya (jadi 9 + 2) supaya tidak ada chunk
-        # ber-isi 1 ataupun yang kelebihan dari 10.
-        if len(chunks) > 1 and len(chunks[-1]) == 1:
-            chunks[-1].insert(0, chunks[-2].pop())
-
-        for chunk_idx, chunk in enumerate(chunks):
-            media_group = [
-                media_input_map[item["media_type"]](
-                    media=item["file_id"],
-                    # Caption cuma boleh nempel di 1 item -- taruh di item
-                    # pertama dari chunk pertama saja supaya tidak berulang
-                    # di tiap potongan album.
-                    caption=caption if (chunk_idx == 0 and i == 0) else None,
-                )
-                for i, item in enumerate(chunk)
-            ]
-            await send_media_group_with_retry(context, chat_id, media_group)
-            if chunk_idx < len(chunks) - 1:
-                await asyncio.sleep(DELAY_BETWEEN_CHUNKS)
-        return True
-
-    # Fallback: ada tipe yang tidak didukung media group (misal ada GIF
-    # tercampur di dalamnya) -> kirim satu-satu.
-    for i, item in enumerate(items):
-        sender = send_map.get(item["media_type"])
-        if sender is None:
-            continue
-        await sender(
+        msg = await sender(
             chat_id=chat_id,
-            **{item["media_type"]: item["file_id"]},
-            caption=caption if i == 0 else None,
+            **{media_type: items[0]["file_id"]},
+            caption=caption,
+            protect_content=protect,
         )
+        sent_message_ids.append(msg.message_id)
+
+    else:
+        # Lebih dari 1 media -> kirim sebagai album (media group), dipecah
+        # 10-10 karena Telegram membatasi maks 10 item per pesan send_media_group
+        # (jadi 200-300 media otomatis jadi 20-30 pesan album berturutan).
+        # Catatan: Telegram cuma izinkan photo/video/document dicampur dalam 1
+        # media group, "animation" (GIF) tidak bisa ikut di sana.
+        media_input_map = {
+            "photo": InputMediaPhoto,
+            "video": InputMediaVideo,
+            "document": InputMediaDocument,
+        }
+        GROUP_CHUNK_SIZE = 10
+        DELAY_BETWEEN_CHUNKS = 1.5  # detik; jaga-jaga supaya tidak kena flood limit Telegram
+
+        if all(item["media_type"] in media_input_map for item in items):
+            chunks = [items[i:i + GROUP_CHUNK_SIZE] for i in range(0, len(items), GROUP_CHUNK_SIZE)]
+            # send_media_group butuh minimal 2 item per pesan -- kalau potongan
+            # terakhir cuma nyisa 1 (misal total 11, 21, dst.), "pinjam" 1 item
+            # dari potongan sebelumnya (jadi 9 + 2) supaya tidak ada chunk
+            # ber-isi 1 ataupun yang kelebihan dari 10.
+            if len(chunks) > 1 and len(chunks[-1]) == 1:
+                chunks[-1].insert(0, chunks[-2].pop())
+
+            for chunk_idx, chunk in enumerate(chunks):
+                media_group = [
+                    media_input_map[item["media_type"]](
+                        media=item["file_id"],
+                        # Caption cuma boleh nempel di 1 item -- taruh di item
+                        # pertama dari chunk pertama saja supaya tidak berulang
+                        # di tiap potongan album.
+                        caption=caption if (chunk_idx == 0 and i == 0) else None,
+                    )
+                    for i, item in enumerate(chunk)
+                ]
+                messages = await send_media_group_with_retry(
+                    context, chat_id, media_group, protect_content=protect
+                )
+                sent_message_ids.extend(m.message_id for m in messages)
+                if chunk_idx < len(chunks) - 1:
+                    await asyncio.sleep(DELAY_BETWEEN_CHUNKS)
+
+        else:
+            # Fallback: ada tipe yang tidak didukung media group (misal ada GIF
+            # tercampur) -> kirim satu-satu.
+            for i, item in enumerate(items):
+                sender = send_map.get(item["media_type"])
+                if sender is None:
+                    continue
+                msg = await sender(
+                    chat_id=chat_id,
+                    **{item["media_type"]: item["file_id"]},
+                    caption=caption if i == 0 else None,
+                    protect_content=protect,
+                )
+                sent_message_ids.append(msg.message_id)
+
+    if sent_message_ids and not skip_notice:
+        jam = AUTO_DELETE_SECONDS / 3600
+        jam_str = f"{jam:g}"  # "2" bukan "2.0"
+        if protect:
+            notice_text = (
+                f"⏳ Media di atas otomatis terhapus dalam {jam_str} jam dan tidak bisa "
+                "di-forward/disimpan. Tonton sekarang selagi masih ada ya."
+            )
+        else:
+            # Sedang di jendela bebas (20:00-21:00 WIB) -> boleh forward/simpan,
+            # tapi auto-hapus tetap jalan.
+            notice_text = (
+                f"⏳ Media di atas otomatis terhapus dalam {jam_str} jam. Lagi jendela "
+                "bebas forward/simpan sekarang, jadi silakan disimpan kalau perlu."
+            )
+        notice = await context.bot.send_message(chat_id, notice_text)
+        schedule_auto_delete(context, chat_id, sent_message_ids)
+        schedule_auto_delete(context, chat_id, [notice.message_id])  # pesan info ini juga ikut kehapus
+
     return True
 
 
-async def send_media_group_with_retry(context: ContextTypes.DEFAULT_TYPE, chat_id: int, media_group: list) -> None:
+async def send_media_group_with_retry(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, media_group: list, protect_content: bool = False
+) -> list:
     """send_media_group, tapi kalau Telegram balas 'Too Many Requests'
     (wajar kalau kirim puluhan album berturutan), tunggu sesuai retry_after
-    lalu coba lagi sekali."""
+    lalu coba lagi sekali. Return daftar Message yang berhasil terkirim
+    (dipakai buat menjadwalkan auto-hapus)."""
     try:
-        await context.bot.send_media_group(chat_id=chat_id, media=media_group)
+        return await context.bot.send_media_group(
+            chat_id=chat_id, media=media_group, protect_content=protect_content
+        )
     except RetryAfter as e:
         await asyncio.sleep(e.retry_after + 1)
-        await context.bot.send_media_group(chat_id=chat_id, media=media_group)
+        return await context.bot.send_media_group(
+            chat_id=chat_id, media=media_group, protect_content=protect_content
+        )
 
 
 # ---------------------------------------------------------------------
@@ -521,7 +631,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    await deliver_media(update.effective_chat.id, code, context)
+    await deliver_media(update.effective_chat.id, code, context, user.id)
 
 
 # ---------------------------------------------------------------------
@@ -542,7 +652,7 @@ async def check_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await query.answer("Verifikasi berhasil ✅")
     await query.edit_message_text(f"✅ Terverifikasi, {name}! Mengirim video...")
-    await deliver_media(update.effective_chat.id, code, context)
+    await deliver_media(update.effective_chat.id, code, context, user.id)
 
 
 # ---------------------------------------------------------------------
@@ -694,7 +804,7 @@ async def delmedia(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------------
 MEDIA_PAGE_SIZE = 10
 DAILY_SEARCH_LIMIT = 3
-WIB = timezone(timedelta(hours=7))  # reset kuota /cari jam 00:00 WIB
+# WIB sudah didefinisikan di atas (dekat konstanta auto-hapus/proteksi)
 
 
 def format_media_entry(row: dict, bot_username: str) -> str:
@@ -1107,19 +1217,19 @@ def main() -> None:
     )
     app.add_handler(MessageHandler(media_filter, handle_admin_media))
     app.add_handler(CommandHandler(["store", "genlink"], store))
-    app.add_handler(CommandHandler("pl", postlink))
+    app.add_handler(CommandHandler(["postlink", "pl"], postlink))
     app.add_handler(CommandHandler("link", link))
-    app.add_handler(CommandHandler("bs", batchstart))
-    app.add_handler(CommandHandler("bt", batchstatus))
-    app.add_handler(CommandHandler("bd", batchdone))
-    app.add_handler(CommandHandler("bc", batchcancel))
-    app.add_handler(CommandHandler("dm", delmedia))
-    app.add_handler(CommandHandler("lm", listmedia))
-    app.add_handler(CommandHandler("cr", cari))
-    app.add_handler(CommandHandler("br", broadcast))
-    app.add_handler(CommandHandler("sv", setvars))
-    app.add_handler(CommandHandler("dv", delvars))
-    app.add_handler(CommandHandler("gv", getvars))
+    app.add_handler(CommandHandler(["batchstart", "bs"], batchstart))
+    app.add_handler(CommandHandler(["batchstatus", "bt"], batchstatus))
+    app.add_handler(CommandHandler(["batchdone", "bd"], batchdone))
+    app.add_handler(CommandHandler(["batchcancel", "bc"], batchcancel))
+    app.add_handler(CommandHandler(["delmedia", "dm"], delmedia))
+    app.add_handler(CommandHandler(["listmedia", "lm"], listmedia))
+    app.add_handler(CommandHandler(["cari", "cr"], cari))
+    app.add_handler(CommandHandler(["broadcast", "br"], broadcast))
+    app.add_handler(CommandHandler(["setvars", "sv"], setvars))
+    app.add_handler(CommandHandler(["delvars", "dv"], delvars))
+    app.add_handler(CommandHandler(["getvars", "gv"], getvars))
     app.add_handler(CallbackQueryHandler(check_join_callback, pattern=r"^checkjoin_"))
     app.add_handler(CallbackQueryHandler(listmedia_callback, pattern=r"^listmedia_"))
 
