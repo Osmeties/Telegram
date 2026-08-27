@@ -1218,6 +1218,13 @@ async def jadwal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def strip_markdown_v2_escapes(text: str) -> str:
+    """Buang backslash escape MarkdownV2 (misal 'GEN\\-Z' -> 'GEN-Z') --
+    dipakai buat cuplikan/preview teks polos (bukan buat dikirim ulang
+    dengan parse_mode, cuma buat ditampilkan apa adanya)."""
+    return re.sub(r"\\([_*\[\]()~`>#+\-=|{}.!])", r"\1", text)
+
+
 async def jadwallist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not is_admin(user.id):
@@ -1232,7 +1239,8 @@ async def jadwallist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     lines = []
     for r in rows:
         run_at_wib = r["run_at"].astimezone(WIB)
-        snippet = (r["text"] or "(copy pesan/media yang di-reply)").replace("\n", " ")
+        raw = r["text"] or "(copy pesan/media yang di-reply)"
+        snippet = strip_markdown_v2_escapes(raw).replace("\n", " ")
         if len(snippet) > 40:
             snippet = snippet[:40] + "…"
         lines.append(f"#{r['id']} — {run_at_wib.strftime('%d-%m-%Y %H:%M')} WIB — {snippet}")
