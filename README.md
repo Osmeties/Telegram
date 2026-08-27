@@ -218,7 +218,7 @@ Saat user ketik `/` di chat bot, menu yang muncul otomatis berbeda:
 - **Admin** (sesuai `ADMIN_IDS`) melihat semua command: `/genlink`,
   `/store`, `/link`, `/batchstart`, `/batchstatus`, `/batchdone`,
   `/batchcancel`, `/delmedia`, `/listmedia`, `/cari`, `/broadcast`,
-  `/setvars`, `/delvars`, `/getvars`, `/ping`, `/start`.
+  `/setvars`, `/delvars`, `/getvars`, `/jadwal`, `/jadwallist`, `/jadwalbatal`, `/ping`, `/start`.
 
 Ini murni soal tampilan menu supaya rapi — semua command admin **tetap**
 dicek lewat `is_admin()` di kode, jadi member yang tahu nama command-nya
@@ -304,6 +304,38 @@ ini).
 
 Catatan: fitur ini butuh bot jadi **admin** di channel/grup yang wajib
 di-join (bot biasa tidak bisa lihat status member orang lain).
+
+### Broadcast terjadwal (posting terjadwal, ala Facebook)
+Buat jadwal:
+```
+/jadwal 30-08-2026 20:00
+Judul Film
+
+▶️ Putar Video | https://t.me/NamaBot?start=get_KODE
+```
+Waktu (WIB) **wajib** di baris pertama, format `DD-MM-YYYY HH:MM` atau
+`HH:MM` saja (kalau cuma jam, otomatis hari ini — atau besok kalau jam itu
+sudah lewat hari ini). Isi postingan di baris-baris setelahnya, sama persis
+aturannya dengan `/broadcast` Mode 2 (bold/underline kepakai, baris terakhir
+buat tombol, bisa multi-tombol & warna).
+
+Bisa juga reply ke media/pesan yang mau dijadwalkan (persis `/broadcast`
+Mode 1) — isi teks di bawah baris waktu jadi caption override-nya (opsional).
+
+Lihat semua jadwal yang belum jalan:
+```
+/jadwallist
+```
+Batalkan salah satu (sebelum waktunya tiba):
+```
+/jadwalbatal <id>
+```
+(id-nya didapat dari balasan `/jadwal` atau dari `/jadwallist`)
+
+Begitu waktunya tiba, bot otomatis kirim ke semua `TARGET_CHATS` (dicek
+tiap 30 detik) dan kirim laporan singkat ke kamu yang bikin jadwalnya.
+Jadwal disimpan di **Postgres** (bukan cuma di memori), jadi tetap aman &
+tetap jalan walau bot sempat restart/redeploy sebelum waktunya tiba.
 
 ## 4. Ide pengembangan lanjutan
 - **Tombol menarik**: tambahkan `InlineKeyboardMarkup` di pesan broadcast

@@ -31,6 +31,7 @@ import asyncio
 import html
 import json
 import logging
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from datetime import time as dt_time
@@ -90,6 +91,9 @@ ADMIN_COMMANDS = PUBLIC_COMMANDS + [
     BotCommand("delvars", "Untuk menghapus variabel"),
     BotCommand("getvars", "Untuk mendapatkan daftar variabel"),
     BotCommand("broadcast", "Untuk mengirimkan pesan ke channel/grup"),
+    BotCommand("jadwal", "Jadwalkan broadcast (posting terjadwal)"),
+    BotCommand("jadwallist", "Lihat daftar broadcast terjadwal"),
+    BotCommand("jadwalbatal", "Batalkan broadcast terjadwal"),
 ]
 
 
@@ -972,6 +976,66 @@ def parse_button_lines(lines: list[str]) -> tuple[int, list[list[InlineKeyboardB
     return idx, rows
 
 
+def button_rows_to_spec(rows: list[list[InlineKeyboardButton]]) -> list:
+    """InlineKeyboardButton (objek, tidak bisa disimpan ke DB) -> list dict polos
+    (bisa di-JSON-kan), buat disimpan sbg button_spec di scheduled_broadcasts."""
+    return [
+        [{"label": b.text, "url": b.url, "style": b.style} for b in row]
+        for row in rows
+    ]
+
+
+def spec_to_keyboard(spec: list | None) -> InlineKeyboardMarkup | None:
+    """Kebalikan dari button_rows_to_spec -- dipakai saat jadwal dieksekusi."""
+    if not spec:
+        return None
+    rows = []
+    for row in spec:
+        btn_row = []
+        for b in row:
+            kwargs = {"url": b["url"]}
+            if b.get("style"):
+                kwargs["style"] = b["style"]
+            btn_row.append(InlineKeyboardButton(b["label"], **kwargs))
+        rows.append(btn_row)
+    return InlineKeyboardMarkup(rows)
+
+
+def parse_schedule_time(spec: str) -> tuple[datetime | None, str | None]:
+    """Parse 'DD-MM-YYYY HH:MM' atau 'HH:MM' saja (WIB, otomatis hari
+    ini/besok). Return (waktu_wib, pesan_error) -- salah satu None."""
+    spec = spec.strip()
+    now_wib = datetime.now(WIB)
+
+    m = re.match(r"^(\d{2})-(\d{2})-(\d{4})\s+(\d{2}):(\d{2})$", spec)
+    if m:
+        day, month, year, hour, minute = map(int, m.groups())
+        try:
+            run_at = datetime(year, month, day, hour, minute, tzinfo=WIB)
+        except ValueError:
+            return None, "Tanggal/jam tidak valid. Cek lagi angkanya."
+    else:
+        m2 = re.match(r"^(\d{2}):(\d{2})$", spec)
+        if not m2:
+            return None, (
+                "Format waktu salah. Baris pertama harus salah satu:\n"
+                "DD-MM-YYYY HH:MM (contoh: 30-08-2026 20:00)\n"
+                "atau HH:MM saja (contoh: 20:00 -> otomatis hari ini, atau besok "
+                "kalau jam segitu sudah lewat)"
+            )
+        hour, minute = map(int, m2.groups())
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            return None, "Jam tidak valid."
+        run_at = now_wib.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if run_at <= now_wib:
+            run_at += timedelta(days=1)
+
+    if run_at <= now_wib:
+        return None, "Waktu itu sudah lewat. Pakai waktu di masa depan."
+
+    return run_at, None
+
+
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not is_admin(user.id):
@@ -1066,6 +1130,183 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             failed += 1
 
     await update.message.reply_text(f"Broadcast selesai. Sukses: {sent}, Gagal: {failed}")
+
+
+# ---------------------------------------------------------------------
+# /jadwal, /jadwallist, /jadwalbatal -> broadcast terjadwal (ala posting
+# terjadwal Facebook). Disimpan di Postgres (scheduled_broadcasts), jadi
+# tetap jalan walau bot sempat restart sebelum waktunya tiba -- job
+# run_due_scheduled_broadcasts yang jalan tiap 30 detik yang mengeksekusi.
+# ---------------------------------------------------------------------
+async def jadwal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Perintah ini khusus admin.")
+        return
+
+    replied = update.message.reply_to_message
+    plain_full = update.message.text or ""
+    md_full = update.message.text_markdown_v2 or plain_full
+
+    plain_parts = plain_full.split(None, 1)
+    if len(plain_parts) < 2:
+        await update.message.reply_text(
+            "Format:\n/jadwal <DD-MM-YYYY HH:MM atau HH:MM>\n<isi postingan...>\n\n"
+            "Waktu WIB, harus di baris PERTAMA sendirian. Contoh:\n"
+            "/jadwal 30-08-2026 20:00\nJudul Film\n\n"
+            "▶️ Putar Video | https://t.me/NamaBot?start=get_KODE\n\n"
+            "Atau reply ke media/pesan yang mau dijadwalkan (isi teks di bawah "
+            "waktu jadi caption/override-nya, opsional)."
+        )
+        return
+
+    plain_lines_all = plain_parts[1].rstrip().splitlines()
+    md_parts = md_full.split(None, 1)
+    md_lines_all = (md_parts[1] if len(md_parts) > 1 else "").rstrip().splitlines()
+
+    time_line = plain_lines_all[0].strip()
+    run_at_wib, err = parse_schedule_time(time_line)
+    if err:
+        await update.message.reply_text(err)
+        return
+
+    plain_lines = plain_lines_all[1:]
+    md_lines = md_lines_all[1:] if len(md_lines_all) == len(plain_lines_all) else md_lines_all
+
+    keep_idx, button_rows = parse_button_lines(plain_lines)
+    if not button_rows and plain_lines and "|" in plain_lines[-1]:
+        await update.message.reply_text(
+            "Format tombol salah. Pastikan tiap baris tombol:\n"
+            "<teks tombol> | <url yang valid, diawali http/https>\n"
+            "atau dengan warna: <teks tombol> | <url> | <biru/hijau/merah>\n"
+            "(pisahkan dengan || kalau mau beberapa tombol sebaris)"
+        )
+        return
+
+    removed_count = len(plain_lines) - keep_idx
+    plain_lines = plain_lines[:keep_idx]
+    if len(md_lines) == len(plain_lines) + removed_count:
+        md_lines = md_lines[: len(md_lines) - removed_count] if removed_count else md_lines
+
+    custom_text = "\n".join(md_lines).strip()
+    button_spec = button_rows_to_spec(button_rows) if button_rows else None
+
+    if replied is None and not custom_text:
+        await update.message.reply_text(
+            "Reply ke pesan/media yang mau dijadwalkan, ATAU tulis isi postingannya "
+            "di baris-baris setelah waktu (baris pertama)."
+        )
+        return
+
+    source_chat_id = replied.chat_id if replied else None
+    source_message_id = replied.message_id if replied else None
+    run_at_utc = run_at_wib.astimezone(timezone.utc)
+
+    sched_id = await db.create_scheduled_broadcast(
+        created_by=user.id,
+        run_at=run_at_utc,
+        text=custom_text or None,
+        button_spec=button_spec,
+        source_chat_id=source_chat_id,
+        source_message_id=source_message_id,
+    )
+
+    await update.message.reply_text(
+        f"📅 Terjadwal (#{sched_id}) — {run_at_wib.strftime('%d-%m-%Y %H:%M')} WIB.\n"
+        f"Lihat semua: /jadwallist\n"
+        f"Batalkan: /jadwalbatal {sched_id}"
+    )
+
+
+async def jadwallist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Perintah ini khusus admin.")
+        return
+
+    rows = await db.list_pending_scheduled_broadcasts()
+    if not rows:
+        await update.message.reply_text("Tidak ada broadcast terjadwal saat ini.")
+        return
+
+    lines = []
+    for r in rows:
+        run_at_wib = r["run_at"].astimezone(WIB)
+        snippet = (r["text"] or "(copy pesan/media yang di-reply)").replace("\n", " ")
+        if len(snippet) > 40:
+            snippet = snippet[:40] + "…"
+        lines.append(f"#{r['id']} — {run_at_wib.strftime('%d-%m-%Y %H:%M')} WIB — {snippet}")
+
+    await update.message.reply_text(
+        "📅 Broadcast terjadwal (belum jalan):\n\n" + "\n".join(lines) +
+        "\n\nBatalkan salah satu: /jadwalbatal <id>"
+    )
+
+
+async def jadwalbatal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Perintah ini khusus admin.")
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Format: /jadwalbatal <id>  (lihat id lewat /jadwallist)")
+        return
+
+    ok = await db.cancel_scheduled_broadcast(int(context.args[0]))
+    if ok:
+        await update.message.reply_text("✅ Jadwal dibatalkan.")
+    else:
+        await update.message.reply_text(
+            "Tidak ketemu jadwal dengan id itu (mungkin sudah terkirim/dibatalkan/salah id)."
+        )
+
+
+async def run_due_scheduled_broadcasts(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Dipanggil berkala oleh JobQueue (lihat post_init). Cari jadwal yang
+    waktunya sudah lewat & masih 'pending', lalu kirim persis seperti /broadcast."""
+    due = await db.get_due_scheduled_broadcasts(datetime.now(timezone.utc))
+    if not due:
+        return
+
+    target_chats = await get_target_chats()
+    for item in due:
+        keyboard = spec_to_keyboard(item["button_spec"])
+        sent, failed = 0, 0
+        for chat_id in target_chats:
+            try:
+                if item["source_chat_id"] and item["source_message_id"]:
+                    await context.bot.copy_message(
+                        chat_id=chat_id,
+                        from_chat_id=item["source_chat_id"],
+                        message_id=item["source_message_id"],
+                        caption=item["text"] or None,
+                        parse_mode=ParseMode.MARKDOWN_V2 if item["text"] else None,
+                        reply_markup=keyboard,
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id,
+                        item["text"] or "",
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=keyboard,
+                        disable_web_page_preview=True,
+                    )
+                sent += 1
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Gagal jalankan broadcast terjadwal #%s ke %s: %s", item["id"], chat_id, e)
+                failed += 1
+
+        await db.mark_scheduled_broadcast(item["id"], "sent" if sent > 0 else "failed")
+
+        try:
+            await context.bot.send_message(
+                item["created_by"],
+                f"📅 Broadcast terjadwal #{item['id']} sudah dijalankan. "
+                f"Sukses: {sent}, Gagal: {failed}",
+            )
+        except TelegramError:
+            pass  # wajar gagal kalau admin itu belum pernah /start bot ini
 
 
 # ---------------------------------------------------------------------
@@ -1196,6 +1437,20 @@ async def post_init(application: Application) -> None:
 
     logger.info("Menu command terpasang.")
 
+    # Cek jadwal broadcast tiap 30 detik. "first=10" -> mulai 10 detik
+    # setelah bot nyala (bukan langsung 0 detik) supaya init_db/menu selesai
+    # dulu, dan supaya jadwal yang "kelewat" pas bot mati langsung diproses
+    # begitu bot nyala lagi.
+    if application.job_queue is not None:
+        application.job_queue.run_repeating(
+            run_due_scheduled_broadcasts, interval=30, first=10, name="scheduled_broadcasts"
+        )
+    else:
+        logger.warning(
+            "job_queue tidak aktif -- /jadwal tidak akan pernah tereksekusi. "
+            "Pastikan 'python-telegram-bot[job-queue]' terpasang."
+        )
+
 
 async def post_shutdown(application: Application) -> None:
     await db.close_db()
@@ -1227,6 +1482,9 @@ def main() -> None:
     app.add_handler(CommandHandler(["listmedia", "lm"], listmedia))
     app.add_handler(CommandHandler(["cari", "cr"], cari))
     app.add_handler(CommandHandler(["broadcast", "br"], broadcast))
+    app.add_handler(CommandHandler(["jadwal", "jd"], jadwal))
+    app.add_handler(CommandHandler(["jadwallist", "jl"], jadwallist))
+    app.add_handler(CommandHandler(["jadwalbatal", "jb"], jadwalbatal))
     app.add_handler(CommandHandler(["setvars", "sv"], setvars))
     app.add_handler(CommandHandler(["delvars", "dv"], delvars))
     app.add_handler(CommandHandler(["getvars", "gv"], getvars))

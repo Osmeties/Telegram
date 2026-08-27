@@ -77,6 +77,29 @@ async def init_db() -> None:
             )
             """
         )
+        # Broadcast terjadwal ("posting terjadwal" ala Facebook) -- disimpan
+        # permanen di sini (bukan cuma di memori) supaya tetap jalan walau
+        # bot sempat restart/redeploy sebelum waktunya tiba.
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scheduled_broadcasts (
+                id SERIAL PRIMARY KEY,
+                created_by BIGINT NOT NULL,
+                run_at TIMESTAMPTZ NOT NULL,
+                text TEXT,
+                button_spec JSONB,
+                source_chat_id BIGINT,
+                source_message_id BIGINT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                sent_at TIMESTAMPTZ
+            )
+            """
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sched_pending_run_at "
+            "ON scheduled_broadcasts (run_at) WHERE status = 'pending'"
+        )
 
 
 async def close_db() -> None:
@@ -230,3 +253,88 @@ async def get_all_settings() -> dict:
     async with _pool.acquire() as conn:
         rows = await conn.fetch("SELECT key, value FROM settings ORDER BY key")
         return {r["key"]: r["value"] for r in rows}
+
+
+# ---------------------------------------------------------------------
+# Broadcast terjadwal
+# ---------------------------------------------------------------------
+async def create_scheduled_broadcast(
+    created_by: int,
+    run_at,
+    text: str | None,
+    button_spec: list | None,
+    source_chat_id: int | None,
+    source_message_id: int | None,
+) -> int:
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO scheduled_broadcasts
+                (created_by, run_at, text, button_spec, source_chat_id, source_message_id)
+            VALUES ($1, $2, $3, $4::jsonb, $5, $6)
+            RETURNING id
+            """,
+            created_by, run_at, text,
+            json.dumps(button_spec) if button_spec else None,
+            source_chat_id, source_message_id,
+        )
+        return row["id"]
+
+
+async def get_due_scheduled_broadcasts(now) -> list[dict]:
+    """Ambil semua jadwal yang statusnya masih 'pending' dan waktunya sudah lewat."""
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, created_by, run_at, text, button_spec, source_chat_id, source_message_id
+            FROM scheduled_broadcasts
+            WHERE status = 'pending' AND run_at <= $1
+            ORDER BY run_at
+            """,
+            now,
+        )
+        result = []
+        for r in rows:
+            d = dict(r)
+            if d["button_spec"] and isinstance(d["button_spec"], str):
+                d["button_spec"] = json.loads(d["button_spec"])
+            result.append(d)
+        return result
+
+
+async def mark_scheduled_broadcast(id_: int, status: str) -> None:
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE scheduled_broadcasts
+            SET status = $1, sent_at = CASE WHEN $1 = 'sent' THEN now() ELSE sent_at END
+            WHERE id = $2
+            """,
+            status, id_,
+        )
+
+
+async def list_pending_scheduled_broadcasts(limit: int = 20) -> list[dict]:
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, run_at, text, source_chat_id
+            FROM scheduled_broadcasts
+            WHERE status = 'pending'
+            ORDER BY run_at
+            LIMIT $1
+            """,
+            limit,
+        )
+        return [dict(r) for r in rows]
+
+
+async def cancel_scheduled_broadcast(id_: int) -> bool:
+    """Return True kalau ada jadwal 'pending' dengan id itu yang berhasil dibatalkan."""
+    async with _pool.acquire() as conn:
+        result = await conn.execute(
+            "UPDATE scheduled_broadcasts SET status = 'cancelled' "
+            "WHERE id = $1 AND status = 'pending'",
+            id_,
+        )
+        return result.split()[-1] != "0"
