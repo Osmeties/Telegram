@@ -1725,6 +1725,25 @@ async def post_shutdown(application: Application) -> None:
     await db.close_db()
 
 
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Jaring pengaman terakhir: kalau ada error yang lolos dari semua
+    try/except di command masing-masing (misal error pas parsing teks
+    SEBELUM sempat masuk ke loop kirim), tanpa ini admin cuma diem-diem
+    tidak dapat balasan apa pun -- error-nya cuma nyangkut di log server.
+    Sekarang selalu dibalas ke chat yang minta, jadi kelihatan."""
+    logger.error("Unhandled exception saat proses update: %s", update, exc_info=context.error)
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            err_text = html.escape(str(context.error))[:500]
+            await update.effective_message.reply_text(
+                f"⚠️ Terjadi error pas proses perintah ini:\n<code>{err_text}</code>\n\n"
+                "Cek format perintahnya lagi, atau coba ulang.",
+                parse_mode=ParseMode.HTML,
+            )
+    except Exception:  # noqa: BLE001
+        pass  # jangan sampai error handler-nya sendiri ikut crash
+
+
 def main() -> None:
     app = (
         Application.builder()
@@ -1761,6 +1780,7 @@ def main() -> None:
     app.add_handler(CommandHandler(["getvars", "gv"], getvars))
     app.add_handler(CallbackQueryHandler(check_join_callback, pattern=r"^checkjoin_"))
     app.add_handler(CallbackQueryHandler(listmedia_callback, pattern=r"^listmedia_"))
+    app.add_error_handler(global_error_handler)
 
     logger.info("Bot berjalan...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
