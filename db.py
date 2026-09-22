@@ -90,12 +90,25 @@ async def init_db() -> None:
                 button_spec JSONB,
                 source_chat_id BIGINT,
                 source_message_id BIGINT,
+                thumb_channel_file_id TEXT,
+                thumb_group_file_id TEXT,
+                media_file_id TEXT,
+                media_type TEXT,
+                source_caption TEXT,
                 status TEXT NOT NULL DEFAULT 'pending',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 sent_at TIMESTAMPTZ
             )
             """
         )
+        # Migrasi utk instalasi lama: kolom thumbnail/media di bawah ini belum
+        # ada dulu (fitur thumbnail beda channel/grup utk /jadwal ditambah
+        # belakangan).
+        await conn.execute("ALTER TABLE scheduled_broadcasts ADD COLUMN IF NOT EXISTS thumb_channel_file_id TEXT")
+        await conn.execute("ALTER TABLE scheduled_broadcasts ADD COLUMN IF NOT EXISTS thumb_group_file_id TEXT")
+        await conn.execute("ALTER TABLE scheduled_broadcasts ADD COLUMN IF NOT EXISTS media_file_id TEXT")
+        await conn.execute("ALTER TABLE scheduled_broadcasts ADD COLUMN IF NOT EXISTS media_type TEXT")
+        await conn.execute("ALTER TABLE scheduled_broadcasts ADD COLUMN IF NOT EXISTS source_caption TEXT")
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sched_pending_run_at "
             "ON scheduled_broadcasts (run_at) WHERE status = 'pending'"
@@ -265,18 +278,25 @@ async def create_scheduled_broadcast(
     button_spec: list | None,
     source_chat_id: int | None,
     source_message_id: int | None,
+    thumb_channel_file_id: str | None = None,
+    thumb_group_file_id: str | None = None,
+    media_file_id: str | None = None,
+    media_type: str | None = None,
+    source_caption: str | None = None,
 ) -> int:
     async with _pool.acquire() as conn:
         row = await conn.fetchrow(
             """
             INSERT INTO scheduled_broadcasts
-                (created_by, run_at, text, button_spec, source_chat_id, source_message_id)
-            VALUES ($1, $2, $3, $4::jsonb, $5, $6)
+                (created_by, run_at, text, button_spec, source_chat_id, source_message_id,
+                 thumb_channel_file_id, thumb_group_file_id, media_file_id, media_type, source_caption)
+            VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11)
             RETURNING id
             """,
             created_by, run_at, text,
             json.dumps(button_spec) if button_spec else None,
             source_chat_id, source_message_id,
+            thumb_channel_file_id, thumb_group_file_id, media_file_id, media_type, source_caption,
         )
         return row["id"]
 
@@ -286,7 +306,8 @@ async def get_due_scheduled_broadcasts(now) -> list[dict]:
     async with _pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT id, created_by, run_at, text, button_spec, source_chat_id, source_message_id
+            SELECT id, created_by, run_at, text, button_spec, source_chat_id, source_message_id,
+                   thumb_channel_file_id, thumb_group_file_id, media_file_id, media_type, source_caption
             FROM scheduled_broadcasts
             WHERE status = 'pending' AND run_at <= $1
             ORDER BY run_at
