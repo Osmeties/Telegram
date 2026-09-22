@@ -12,6 +12,10 @@ Fitur:
    (REQUIRED_CHATS), lalu kirim media yang tersimpan ke chat pribadi user.
 4. /broadcast -> admin reply ke sebuah pesan (teks/media) untuk mengirim
               pesan itu ke semua channel/grup di TARGET_CHATS.
+4b. /thumbch, /thumbgrp -> admin reply ke sebuah FOTO untuk set thumbnail
+              berbeda ke channel vs grup (sesuai "kind" tiap entri di
+              TARGET_CHATS), dipakai otomatis di /postlink atau /broadcast
+              berikutnya lalu langsung ke-reset.
 5. /setvars, /delvars, /getvars -> admin atur TARGET_CHATS & REQUIRED_CHATS
               langsung dari chat, tanpa perlu ubah Railway Variables.
               Nilai ini disimpan di database dan menimpa nilai default dari
@@ -79,6 +83,8 @@ PUBLIC_COMMANDS = [
 ADMIN_COMMANDS = PUBLIC_COMMANDS + [
     BotCommand("genlink", "Untuk membuat link fsub / konten"),
     BotCommand("postlink", "Upload media + langsung posting link ke channel"),
+    BotCommand("thumbch", "Set thumbnail (reply foto) khusus utk channel, dipakai post berikutnya"),
+    BotCommand("thumbgrp", "Set thumbnail (reply foto) khusus utk grup, dipakai post berikutnya"),
     BotCommand("store", "Alias dari /genlink"),
     BotCommand("link", "Ambil ulang link dari kode yang sudah ada"),
     BotCommand("batchstart", "Mulai kumpulkan banyak media (sampai ratusan) ke 1 kode"),
@@ -104,11 +110,31 @@ def is_admin(user_id: int) -> bool:
 # ---------------------------------------------------------------------
 # Nilai efektif TARGET_CHATS / REQUIRED_CHATS (DB override > config/env)
 # ---------------------------------------------------------------------
-async def get_target_chats() -> list[int]:
+async def get_target_chats() -> list[dict]:
+    """Kembalikan TARGET_CHATS efektif, selalu sebagai list of dict
+    {"chat_id": int, "kind": "channel"/"group"/None}. Mendukung 3 bentuk
+    value yang mungkin tersimpan di DB (biar tidak rusak kalau baru upgrade
+    dari format lama):
+    - JSON list of dict (format baru): [{"chat_id":.., "kind":..}, ...]
+    - JSON list of int (edge case): [-100111, -100222]
+    - String lama dipisah koma: "-100111,-100222" (kind jadi None utk semua,
+      artinya tidak dapat thumbnail custom -- tetap jalan seperti sebelumnya)
+    """
     val = await db.get_setting("TARGET_CHATS")
-    if val:
-        return [int(x) for x in val.split(",") if x.strip()]
-    return TARGET_CHATS
+    if not val:
+        return TARGET_CHATS
+
+    try:
+        parsed = json.loads(val)
+    except json.JSONDecodeError:
+        parsed = None
+
+    if parsed is not None:
+        if parsed and isinstance(parsed[0], dict):
+            return parsed
+        return [{"chat_id": int(c), "kind": None} for c in parsed]
+
+    return [{"chat_id": int(x), "kind": None} for x in val.split(",") if x.strip()]
 
 
 async def get_required_chats() -> list[dict]:
@@ -154,6 +180,188 @@ def build_join_keyboard(missing: list[dict], code: str) -> InlineKeyboardMarkup:
     rows = [join_buttons[i:i + 2] for i in range(0, len(join_buttons), 2)]
     rows.append([InlineKeyboardButton("🔄 COBA LAGI", callback_data=f"checkjoin_{code}")])
     return InlineKeyboardMarkup(rows)
+
+
+# ---------------------------------------------------------------------
+# Thumbnail per-tujuan (channel vs grup) untuk /postlink & /broadcast.
+#
+# Alurnya: admin reply sebuah FOTO dengan /thumbch (utk channel) dan/atau
+# /thumbgrp (utk grup) SEBELUM jalanin /postlink atau /broadcast. Command
+# posting berikutnya otomatis pakai thumbnail itu (dicocokkan lewat "kind"
+# tiap entri TARGET_CHATS), lalu langsung di-reset -- jadi harus di-set
+# ulang tiap mau posting, sesuai maunya.
+#
+# Catatan teknis: utk /postlink (post teks+tombol), thumbnail dipakai
+# sebagai FOTO utama post itu -- boleh pakai file_id apa adanya. Tapi utk
+# /broadcast yang bawa video/dokumen/animasi, thumbnail itu beneran
+# "preview frame" dari Bot API, dan Bot API MEWAJIBKAN thumbnail di-upload
+# fresh (tidak boleh reuse file_id) -- makanya ada _download_thumb_bytes.
+# ---------------------------------------------------------------------
+PENDING_THUMB_TTL = 3600  # detik; kalau lupa dipakai, basi setelah 1 jam
+
+
+def _get_pending_thumb_entry(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> dict:
+    store = context.bot_data.setdefault("pending_thumbs", {})
+    entry = store.get(user_id)
+    if entry is not None and time.time() - entry["ts"] > PENDING_THUMB_TTL:
+        entry = None
+    if entry is None:
+        entry = {"channel": None, "group": None, "ts": time.time()}
+        store[user_id] = entry
+    return entry
+
+
+def pop_pending_thumbs(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> dict:
+    """Ambil & langsung hapus sesi thumbnail admin ini (dipanggil pas
+    /postlink atau /broadcast benar-benar mengirim). Basi -> dianggap kosong."""
+    store = context.bot_data.setdefault("pending_thumbs", {})
+    entry = store.pop(user_id, None)
+    if entry is None or time.time() - entry["ts"] > PENDING_THUMB_TTL:
+        return {"channel": None, "group": None}
+    return entry
+
+
+async def _set_pending_thumb(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str, label: str) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Perintah ini khusus admin.")
+        return
+
+    replied = update.message.reply_to_message
+    if replied is None or not replied.photo:
+        await update.message.reply_text(
+            f"Reply command ini ke sebuah FOTO untuk dijadikan thumbnail {label}."
+        )
+        return
+
+    entry = _get_pending_thumb_entry(context, user.id)
+    entry[kind] = replied.photo[-1].file_id
+    entry["ts"] = time.time()
+
+    other_kind = "group" if kind == "channel" else "channel"
+    other_label = "grup" if kind == "channel" else "channel"
+    other_status = "✅ sudah di-set" if entry[other_kind] else "belum di-set"
+    await update.message.reply_text(
+        f"✅ Thumbnail {label} disimpan.\nThumbnail {other_label}: {other_status}.\n\n"
+        "Keduanya otomatis kepakai di /postlink atau /broadcast berikutnya, "
+        "lalu ke-reset (harus di-set ulang tiap mau posting)."
+    )
+
+
+async def thumbch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _set_pending_thumb(update, context, "channel", "channel")
+
+
+async def thumbgrp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _set_pending_thumb(update, context, "group", "grup")
+
+
+async def _download_thumb_bytes(context: ContextTypes.DEFAULT_TYPE, file_id: str | None) -> bytes | None:
+    """Download foto thumbnail jadi bytes. WAJIB dilakukan fresh tiap broadcast
+    karena Bot API tidak izinkan reuse file_id langsung sebagai parameter
+    'thumbnail' (beda dengan parameter media utama yang boleh reuse file_id)."""
+    if not file_id:
+        return None
+    try:
+        tg_file = await context.bot.get_file(file_id)
+        return bytes(await tg_file.download_as_bytearray())
+    except TelegramError as e:
+        logger.warning("Gagal download thumbnail %s: %s", file_id, e)
+        return None
+
+
+PREVIEW_THUMB_MEDIA_TYPES = ("video", "document", "animation")
+
+
+async def _send_broadcast_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    kind: str | None,
+    thumbs: dict,
+    *,
+    media_type: str | None,
+    media_file_id: str | None,
+    source_chat_id: int | None,
+    source_message_id: int | None,
+    caption_md: str | None,
+    keyboard: InlineKeyboardMarkup | None,
+    thumb_bytes_cache: dict,
+) -> None:
+    """Kirim 1 pesan broadcast ke 1 chat, terapkan thumbnail per-kind (channel
+    vs group) kalau relevan. Dipakai bareng oleh /broadcast (langsung) dan
+    run_due_scheduled_broadcasts (/jadwal, tertunda) supaya logikanya sama
+    persis, tidak dobel kode.
+
+    - source_message_id None -> mode teks polos, tidak ada pesan sumber sama
+      sekali (caption_md WAJIB diisi di kasus ini).
+    - media_type "photo" + ada thumbnail utk kind ini -> foto DIGANTI
+      sepenuhnya pakai thumbnail itu.
+    - media_type video/document/animation + ada thumbnail -> file aslinya
+      tetap sama, cuma PREVIEW-nya yang diganti (butuh download bytes fresh).
+    - Selain itu (tidak ada thumbnail relevan, atau tipe media tidak
+      didukung) -> copy_message apa adanya dari source_chat_id/message_id,
+      opsional timpa caption kalau caption_md diisi.
+
+    thumb_bytes_cache: dict mutable yg dipakai LINTAS PANGGILAN (1 broadcast
+    ke banyak chat) supaya video/dokumen/animasi cuma didownload sekali per
+    kind, bukan re-download tiap chat_id.
+    """
+    thumb_file_id = thumbs.get(kind) if kind else None
+
+    if source_message_id is None:
+        # Mode teks polos: tidak ada apa pun yang bisa di-copy.
+        if thumb_file_id:
+            await context.bot.send_photo(
+                chat_id, photo=thumb_file_id, caption=caption_md or "",
+                parse_mode=ParseMode.MARKDOWN_V2, reply_markup=keyboard,
+            )
+        else:
+            await context.bot.send_message(
+                chat_id, caption_md or "", parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=keyboard, disable_web_page_preview=True,
+            )
+        return
+
+    if thumb_file_id and media_type == "photo" and media_file_id:
+        await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=thumb_file_id,
+            caption=caption_md or None,
+            parse_mode=ParseMode.MARKDOWN_V2 if caption_md else None,
+            reply_markup=keyboard,
+        )
+        return
+
+    if thumb_file_id and media_type in PREVIEW_THUMB_MEDIA_TYPES and media_file_id:
+        if kind not in thumb_bytes_cache:
+            thumb_bytes_cache[kind] = await _download_thumb_bytes(context, thumb_file_id)
+        thumb_bytes = thumb_bytes_cache[kind]
+        if thumb_bytes:
+            sender = {
+                "video": context.bot.send_video,
+                "document": context.bot.send_document,
+                "animation": context.bot.send_animation,
+            }[media_type]
+            await sender(
+                chat_id=chat_id,
+                **{media_type: media_file_id},
+                thumbnail=thumb_bytes,
+                caption=caption_md or None,
+                parse_mode=ParseMode.MARKDOWN_V2 if caption_md else None,
+                reply_markup=keyboard,
+            )
+            return
+        # Gagal download thumbnail -> lanjut ke fallback copy_message di bawah,
+        # jangan sampai broadcast gagal total gara-gara thumbnail doang.
+
+    await context.bot.copy_message(
+        chat_id=chat_id,
+        from_chat_id=source_chat_id,
+        message_id=source_message_id,
+        caption=caption_md or None,
+        parse_mode=ParseMode.MARKDOWN_V2 if caption_md else None,
+        reply_markup=keyboard,
+    )
 
 
 # ---------------------------------------------------------------------
@@ -748,21 +956,34 @@ async def postlink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not target_chats:
         await update.message.reply_text(
             "⚠️ TARGET_CHATS masih kosong, jadi tidak ada channel/grup tujuan.\n"
-            "Isi dulu lewat /setvars TARGET_CHATS <chat_id> sebelum posting."
+            "Isi dulu lewat /setvars TARGET_CHATS (lihat /setvars tanpa argumen "
+            "untuk contoh formatnya)."
         )
         return
 
+    thumbs = pop_pending_thumbs(context, user.id)
+
     sent, failed = 0, 0
-    for chat_id in target_chats:
+    for chat in target_chats:
+        chat_id, kind = chat["chat_id"], chat.get("kind")
+        thumb_file_id = thumbs.get(kind) if kind else None
         try:
-            await context.bot.send_message(chat_id, post_text, reply_markup=keyboard)
+            if thumb_file_id:
+                await context.bot.send_photo(
+                    chat_id, photo=thumb_file_id, caption=post_text, reply_markup=keyboard
+                )
+            else:
+                await context.bot.send_message(chat_id, post_text, reply_markup=keyboard)
             sent += 1
         except Exception as e:  # noqa: BLE001
             logger.warning("Gagal posting ke %s: %s", chat_id, e)
             failed += 1
 
+    thumb_note = ""
+    if thumbs.get("channel") or thumbs.get("group"):
+        thumb_note = "\n\n(Thumbnail channel/grup yang di-set sudah terpakai & ke-reset.)"
     await update.message.reply_text(
-        f"✅ Posting selesai. Sukses: {sent}, Gagal: {failed}\n\nLink: {deep_link}"
+        f"✅ Posting selesai. Sukses: {sent}, Gagal: {failed}\n\nLink: {deep_link}{thumb_note}"
     )
 
 
@@ -1091,16 +1312,21 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
 
+        thumbs = pop_pending_thumbs(context, user.id)
+        thumb_bytes_cache: dict[str, bytes | None] = {}
+
         sent, failed = 0, 0
         target_chats = await get_target_chats()
-        for chat_id in target_chats:
+        for chat in target_chats:
+            chat_id, kind = chat["chat_id"], chat.get("kind")
             try:
-                await context.bot.send_message(
-                    chat_id,
-                    custom_text,
-                    parse_mode=ParseMode.MARKDOWN_V2,
-                    reply_markup=keyboard,
-                    disable_web_page_preview=True,
+                await _send_broadcast_message(
+                    context, chat_id, kind, thumbs,
+                    media_type=None, media_file_id=None,
+                    source_chat_id=None, source_message_id=None,
+                    caption_md=custom_text,
+                    keyboard=keyboard,
+                    thumb_bytes_cache=thumb_bytes_cache,
                 )
                 sent += 1
             except Exception as e:  # noqa: BLE001
@@ -1112,24 +1338,38 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Mode reply: copy pesan yang di-reply (bawa media kalau ada), opsional
     # timpa caption-nya + pasang tombol dari argumen /broadcast di atas.
+    # Logika thumbnail per-kind (channel vs group) ditangani di satu tempat
+    # oleh _send_broadcast_message -- dipakai bareng dengan /jadwal juga.
+    thumbs = pop_pending_thumbs(context, user.id)
+    thumb_bytes_cache: dict[str, bytes | None] = {}
+
+    replied_file_id, replied_media_type = extract_media(replied)
+    caption_override_md = custom_text or (replied.caption_markdown_v2 or "")
+
     sent, failed = 0, 0
     target_chats = await get_target_chats()
-    for chat_id in target_chats:
+    for chat in target_chats:
+        chat_id, kind = chat["chat_id"], chat.get("kind")
         try:
-            await context.bot.copy_message(
-                chat_id=chat_id,
-                from_chat_id=replied.chat_id,
-                message_id=replied.message_id,
-                caption=custom_text or None,
-                parse_mode=ParseMode.MARKDOWN_V2 if custom_text else None,
-                reply_markup=keyboard,
+            await _send_broadcast_message(
+                context, chat_id, kind, thumbs,
+                media_type=replied_media_type, media_file_id=replied_file_id,
+                source_chat_id=replied.chat_id, source_message_id=replied.message_id,
+                caption_md=caption_override_md,
+                keyboard=keyboard,
+                thumb_bytes_cache=thumb_bytes_cache,
             )
             sent += 1
         except Exception as e:  # noqa: BLE001
             logger.warning("Gagal broadcast ke %s: %s", chat_id, e)
             failed += 1
 
-    await update.message.reply_text(f"Broadcast selesai. Sukses: {sent}, Gagal: {failed}")
+    thumb_note = ""
+    if thumbs.get("channel") or thumbs.get("group"):
+        thumb_note = "\n(Thumbnail channel/grup yang di-set sudah terpakai & ke-reset.)"
+        if replied_media_type not in PREVIEW_THUMB_MEDIA_TYPES and replied_media_type != "photo":
+            thumb_note += " (Tidak diterapkan karena tipe media ini tidak didukung.)"
+    await update.message.reply_text(f"Broadcast selesai. Sukses: {sent}, Gagal: {failed}{thumb_note}")
 
 
 # ---------------------------------------------------------------------
@@ -1198,6 +1438,10 @@ async def jadwal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    thumbs = pop_pending_thumbs(context, user.id)
+    media_file_id, media_type = extract_media(replied) if replied else (None, None)
+    source_caption_md = (replied.caption_markdown_v2 or None) if replied else None
+
     source_chat_id = replied.chat_id if replied else None
     source_message_id = replied.message_id if replied else None
     run_at_utc = run_at_wib.astimezone(timezone.utc)
@@ -1209,12 +1453,20 @@ async def jadwal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         button_spec=button_spec,
         source_chat_id=source_chat_id,
         source_message_id=source_message_id,
+        thumb_channel_file_id=thumbs.get("channel"),
+        thumb_group_file_id=thumbs.get("group"),
+        media_file_id=media_file_id,
+        media_type=media_type,
+        source_caption=source_caption_md,
     )
 
+    thumb_note = ""
+    if thumbs.get("channel") or thumbs.get("group"):
+        thumb_note = "\n(Thumbnail channel/grup yang di-set ikut tersimpan buat jadwal ini.)"
     await update.message.reply_text(
         f"📅 Terjadwal (#{sched_id}) — {run_at_wib.strftime('%d-%m-%Y %H:%M')} WIB.\n"
         f"Lihat semua: /jadwallist\n"
-        f"Batalkan: /jadwalbatal {sched_id}"
+        f"Batalkan: /jadwalbatal {sched_id}{thumb_note}"
     )
 
 
@@ -1272,7 +1524,8 @@ async def jadwalbatal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def run_due_scheduled_broadcasts(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Dipanggil berkala oleh JobQueue (lihat post_init). Cari jadwal yang
-    waktunya sudah lewat & masih 'pending', lalu kirim persis seperti /broadcast."""
+    waktunya sudah lewat & masih 'pending', lalu kirim persis seperti /broadcast
+    (termasuk thumbnail per-kind kalau di-set pas /jadwal dibuat)."""
     due = await db.get_due_scheduled_broadcasts(datetime.now(timezone.utc))
     if not due:
         return
@@ -1280,26 +1533,22 @@ async def run_due_scheduled_broadcasts(context: ContextTypes.DEFAULT_TYPE) -> No
     target_chats = await get_target_chats()
     for item in due:
         keyboard = spec_to_keyboard(item["button_spec"])
+        caption_md = item["text"] or item["source_caption"]
+        thumbs = {"channel": item["thumb_channel_file_id"], "group": item["thumb_group_file_id"]}
+        thumb_bytes_cache: dict[str, bytes | None] = {}
+
         sent, failed = 0, 0
-        for chat_id in target_chats:
+        for chat in target_chats:
+            chat_id, kind = chat["chat_id"], chat.get("kind")
             try:
-                if item["source_chat_id"] and item["source_message_id"]:
-                    await context.bot.copy_message(
-                        chat_id=chat_id,
-                        from_chat_id=item["source_chat_id"],
-                        message_id=item["source_message_id"],
-                        caption=item["text"] or None,
-                        parse_mode=ParseMode.MARKDOWN_V2 if item["text"] else None,
-                        reply_markup=keyboard,
-                    )
-                else:
-                    await context.bot.send_message(
-                        chat_id,
-                        item["text"] or "",
-                        parse_mode=ParseMode.MARKDOWN_V2,
-                        reply_markup=keyboard,
-                        disable_web_page_preview=True,
-                    )
+                await _send_broadcast_message(
+                    context, chat_id, kind, thumbs,
+                    media_type=item["media_type"], media_file_id=item["media_file_id"],
+                    source_chat_id=item["source_chat_id"], source_message_id=item["source_message_id"],
+                    caption_md=caption_md,
+                    keyboard=keyboard,
+                    thumb_bytes_cache=thumb_bytes_cache,
+                )
                 sent += 1
             except Exception as e:  # noqa: BLE001
                 logger.warning("Gagal jalankan broadcast terjadwal #%s ke %s: %s", item["id"], chat_id, e)
@@ -1331,9 +1580,12 @@ async def setvars(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             "Format: /setvars <KEY> <value>\n\n"
             "Key yang didukung:\n\n"
-            "• TARGET_CHATS — daftar chat_id tujuan /broadcast, pisah koma\n"
+            "• TARGET_CHATS — daftar chat_id tujuan /broadcast & /postlink, "
+            "format JSON, tiap entri punya \"kind\": \"channel\" atau \"group\" "
+            "(dipakai bot buat milih thumbnail lewat /thumbch & /thumbgrp).\n"
             "  Contoh:\n"
-            "  /setvars TARGET_CHATS -1001111111111,-1002222222222\n\n"
+            '  /setvars TARGET_CHATS [{"chat_id": -1001111111111, "kind": '
+            '"channel"}, {"chat_id": -1002222222222, "kind": "group"}]\n\n'
             "• REQUIRED_CHATS — daftar channel/grup wajib-join, format JSON\n"
             "  Contoh:\n"
             '  /setvars REQUIRED_CHATS [{"chat_id": -1001111111111, '
@@ -1353,9 +1605,16 @@ async def setvars(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         if key == "TARGET_CHATS":
-            parsed = [int(x) for x in value.split(",") if x.strip()]
-            if not parsed:
-                raise ValueError("daftar kosong")
+            parsed = json.loads(value)
+            if not isinstance(parsed, list) or not parsed:
+                raise ValueError("harus berupa list JSON, tidak boleh kosong")
+            for entry in parsed:
+                if not isinstance(entry, dict) or "chat_id" not in entry:
+                    raise ValueError('tiap entri harus dict dengan minimal "chat_id"')
+                entry["chat_id"] = int(entry["chat_id"])
+                entry.setdefault("kind", None)
+                if entry["kind"] not in ("channel", "group", None):
+                    raise ValueError('"kind" harus "channel" atau "group"')
         elif key == "REQUIRED_CHATS":
             parsed = json.loads(value)
             if not isinstance(parsed, list):
@@ -1364,6 +1623,8 @@ async def setvars(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"❌ Format value salah: {e}")
         return
 
+    if key in ("TARGET_CHATS", "REQUIRED_CHATS"):
+        value = json.dumps(parsed)
     await db.set_setting(key, value)
     await update.message.reply_text(f"✅ {key} berhasil disimpan.")
 
@@ -1481,6 +1742,8 @@ def main() -> None:
     app.add_handler(MessageHandler(media_filter, handle_admin_media))
     app.add_handler(CommandHandler(["store", "genlink"], store))
     app.add_handler(CommandHandler(["postlink", "pl"], postlink))
+    app.add_handler(CommandHandler(["thumbch", "tc"], thumbch))
+    app.add_handler(CommandHandler(["thumbgrp", "tg"], thumbgrp))
     app.add_handler(CommandHandler("link", link))
     app.add_handler(CommandHandler(["batchstart", "bs"], batchstart))
     app.add_handler(CommandHandler(["batchstatus", "bt"], batchstatus))
