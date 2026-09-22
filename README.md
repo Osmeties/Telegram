@@ -30,8 +30,16 @@ pip install -r requirements.txt
    - `BOT_TOKEN` — token dari BotFather.
    - `ADMIN_IDS` — user_id kamu (cek lewat @userinfobot), pisahkan koma
      kalau lebih dari satu, contoh: `123456789,987654321`.
-   - `TARGET_CHATS` — chat_id channel/grup tujuan broadcast, pisahkan
-     koma. Bot harus jadi admin di sana dulu.
+   - `TARGET_CHATS` — channel/grup tujuan broadcast & `/postlink`, format
+     JSON, tiap entri punya `chat_id` dan `kind` (`"channel"` atau
+     `"group"`) — `kind` ini yang dipakai bot buat milih thumbnail beda
+     lewat `/thumbch` & `/thumbgrp` (lihat bagian "Thumbnail beda utk
+     channel & grup" di bawah). Bot harus jadi admin di sana dulu.
+     Contoh:
+     ```
+     [{"chat_id": -1001111111111, "kind": "channel"},
+      {"chat_id": -1002222222222, "kind": "group"}]
+     ```
    - `REQUIRED_CHATS` — channel/grup yang WAJIB di-join sebelum user bisa
      ambil konten dari deep link. Bot harus jadi **admin** di setiap
      channel/grup ini (supaya bisa cek status member lewat
@@ -189,13 +197,52 @@ upload ulang videonya, tinggal jalankan `/postlink PROMO1 🔥 Tonton
 Sekarang` lagi tanpa reply ke media apa pun — bot otomatis pakai video
 yang sudah tersimpan dengan kode itu.
 
+### Thumbnail beda untuk channel & grup
+Kalau kamu mau postingan yang sama (lewat `/postlink` atau `/broadcast`)
+tampil dengan gambar/preview berbeda di channel vs di grup — misal thumbnail
+channel lebih "clickbait" dan thumbnail grup lebih santai — set dulu
+sebelum posting:
+
+```
+(reply ke foto A) /thumbch
+(reply ke foto B) /thumbgrp
+```
+
+Habis itu jalankan `/postlink` atau `/broadcast` seperti biasa. Bot otomatis
+mencocokkan tiap tujuan di `TARGET_CHATS` lewat `kind`-nya: yang `"channel"`
+dapat foto A, yang `"group"` dapat foto B. Setelah terpakai sekali, kedua
+thumbnail itu **otomatis ke-reset** — kalau mau posting lagi dengan
+thumbnail berbeda (atau sama), ulangi `/thumbch`/`/thumbgrp` lagi. Kalau
+lupa dipakai, sesi ini basi sendiri setelah 1 jam.
+
+Boleh isi salah satu saja (misal cuma `/thumbch`, tanpa `/thumbgrp`) — nanti
+cuma channel yang dapat foto, grup tetap posting normal tanpa thumbnail.
+
+Catatan:
+- Untuk `/postlink` (yang isinya teks+tombol tanpa media), thumbnail ini jadi
+  **foto utama** dari post itu (foto + caption + tombol).
+- Untuk `/broadcast` yang reply ke **foto tunggal**, thumbnail ini
+  **mengganti foto itu sepenuhnya** sesuai tujuan — caption & tombolnya tetap
+  sama, cuma gambarnya beda per channel/grup (persis kasus yang biasa kamu
+  pakai: 1 foto ke grup, 1 foto beda ke channel).
+- Untuk `/broadcast` yang reply ke **video/dokumen/animasi tunggal**,
+  thumbnail ini jadi **preview frame** video/dokumen itu (bukan ganti
+  filenya) — videonya sendiri tetap dikirim penuh & sama, cuma gambar
+  preview sebelum di-klik play yang beda per channel/grup.
+- Tidak berlaku untuk broadcast yang reply ke **album/batch** banyak media
+  sekaligus — di kasus itu bot tetap posting normal tanpa thumbnail custom.
+- `/jadwal` (broadcast terjadwal) **juga sudah dukung** ini — jalankan
+  `/thumbch`/`/thumbgrp` sebelum `/jadwal` seperti biasa, thumbnail-nya ikut
+  tersimpan permanen bareng jadwalnya (aman walau bot sempat restart sebelum
+  waktunya tiba).
+
 ### Mengatur TARGET_CHATS / REQUIRED_CHATS langsung dari chat
 Gak perlu lagi bolak-balik ke Railway Variables setiap mau ganti channel
 tujuan broadcast atau channel wajib-join — admin bisa atur langsung:
 
 - **`/setvars <KEY> <value>`** — set/ganti nilai. Contoh:
   ```
-  /setvars TARGET_CHATS -1001111111111,-1002222222222
+  /setvars TARGET_CHATS [{"chat_id": -1001111111111, "kind": "channel"}, {"chat_id": -1002222222222, "kind": "group"}]
   ```
   ```
   /setvars REQUIRED_CHATS [{"chat_id": -1001111111111, "username": "namachannel", "invite_link": null, "label": "📢 Join Channel Utama"}]
@@ -216,9 +263,10 @@ channel tanpa perlu akses dashboard Railway tiap saat.
 Saat user ketik `/` di chat bot, menu yang muncul otomatis berbeda:
 - **Member biasa** hanya melihat `/start` dan `/ping`.
 - **Admin** (sesuai `ADMIN_IDS`) melihat semua command: `/genlink`,
-  `/store`, `/link`, `/batchstart`, `/batchstatus`, `/batchdone`,
-  `/batchcancel`, `/delmedia`, `/listmedia`, `/cari`, `/broadcast`,
-  `/setvars`, `/delvars`, `/getvars`, `/jadwal`, `/jadwallist`, `/jadwalbatal`, `/ping`, `/start`.
+  `/store`, `/postlink`, `/thumbch`, `/thumbgrp`, `/link`, `/batchstart`,
+  `/batchstatus`, `/batchdone`, `/batchcancel`, `/delmedia`, `/listmedia`,
+  `/cari`, `/broadcast`, `/setvars`, `/delvars`, `/getvars`, `/jadwal`,
+  `/jadwallist`, `/jadwalbatal`, `/ping`, `/start`.
 
 Ini murni soal tampilan menu supaya rapi — semua command admin **tetap**
 dicek lewat `is_admin()` di kode, jadi member yang tahu nama command-nya
@@ -321,6 +369,11 @@ buat tombol, bisa multi-tombol & warna).
 
 Bisa juga reply ke media/pesan yang mau dijadwalkan (persis `/broadcast`
 Mode 1) — isi teks di bawah baris waktu jadi caption override-nya (opsional).
+
+Mau thumbnail beda channel/grup buat jadwal ini juga? Jalankan
+`/thumbch`/`/thumbgrp` (reply foto) **sebelum** `/jadwal`-nya, persis seperti
+`/broadcast` biasa (lihat bagian "Thumbnail beda untuk channel & grup" di
+atas) — thumbnail-nya ikut tersimpan bareng jadwalnya sampai waktunya tiba.
 
 Lihat semua jadwal yang belum jalan:
 ```
