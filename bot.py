@@ -110,19 +110,30 @@ def is_admin(user_id: int) -> bool:
 # ---------------------------------------------------------------------
 # Nilai efektif TARGET_CHATS / REQUIRED_CHATS (DB override > config/env)
 # ---------------------------------------------------------------------
+def _normalize_target_chats(raw: list) -> list[dict]:
+    """Terima TARGET_CHATS dalam bentuk apa pun -- list of dict (format baru),
+    list of int (format lama / belum di-migrasi), atau kosong -- dan SELALU
+    kembalikan list of dict {"chat_id": int, "kind": "channel"/"group"/None}."""
+    if not raw:
+        return []
+    if isinstance(raw[0], dict):
+        return raw
+    return [{"chat_id": int(c), "kind": None} for c in raw]
+
+
 async def get_target_chats() -> list[dict]:
     """Kembalikan TARGET_CHATS efektif, selalu sebagai list of dict
-    {"chat_id": int, "kind": "channel"/"group"/None}. Mendukung 3 bentuk
-    value yang mungkin tersimpan di DB (biar tidak rusak kalau baru upgrade
-    dari format lama):
+    {"chat_id": int, "kind": "channel"/"group"/None}. Mendukung semua bentuk
+    value yang mungkin ada -- baik dari config.py/env var (kalau belum pernah
+    di-/setvars) MAUPUN dari DB (kalau sudah pernah di-/setvars):
     - JSON list of dict (format baru): [{"chat_id":.., "kind":..}, ...]
-    - JSON list of int (edge case): [-100111, -100222]
+    - JSON list of int / list of int polos (format lama / belum di-migrasi)
     - String lama dipisah koma: "-100111,-100222" (kind jadi None utk semua,
       artinya tidak dapat thumbnail custom -- tetap jalan seperti sebelumnya)
     """
     val = await db.get_setting("TARGET_CHATS")
     if not val:
-        return TARGET_CHATS
+        return _normalize_target_chats(TARGET_CHATS)
 
     try:
         parsed = json.loads(val)
@@ -130,9 +141,7 @@ async def get_target_chats() -> list[dict]:
         parsed = None
 
     if parsed is not None:
-        if parsed and isinstance(parsed[0], dict):
-            return parsed
-        return [{"chat_id": int(c), "kind": None} for c in parsed]
+        return _normalize_target_chats(parsed)
 
     return [{"chat_id": int(x), "kind": None} for x in val.split(",") if x.strip()]
 
