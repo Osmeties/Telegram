@@ -12,10 +12,12 @@ Fitur:
    (REQUIRED_CHATS), lalu kirim media yang tersimpan ke chat pribadi user.
 4. /broadcast -> admin reply ke sebuah pesan (teks/media) untuk mengirim
               pesan itu ke semua channel/grup di TARGET_CHATS.
-4b. /thumbch, /thumbgrp -> admin reply ke sebuah FOTO untuk set thumbnail
+4b. /temp    -> sama seperti /broadcast, tapi pesannya OTOMATIS DIHAPUS dari
+              semua tujuan tiap jam 02:00 WIB (lihat cleanup_temp_posts).
+4c. /thumbch, /thumbgrp -> admin reply ke sebuah FOTO untuk set thumbnail
               berbeda ke channel vs grup (sesuai "kind" tiap entri di
-              TARGET_CHATS), dipakai otomatis di /postlink atau /broadcast
-              berikutnya lalu langsung ke-reset.
+              TARGET_CHATS), dipakai otomatis di /postlink, /broadcast, atau
+              /temp berikutnya lalu langsung ke-reset.
 5. /setvars, /delvars, /getvars -> admin atur TARGET_CHATS & REQUIRED_CHATS
               langsung dari chat, tanpa perlu ubah Railway Variables.
               Nilai ini disimpan di database dan menimpa nilai default dari
@@ -97,6 +99,7 @@ ADMIN_COMMANDS = PUBLIC_COMMANDS + [
     BotCommand("delvars", "Untuk menghapus variabel"),
     BotCommand("getvars", "Untuk mendapatkan daftar variabel"),
     BotCommand("broadcast", "Untuk mengirimkan pesan ke channel/grup"),
+    BotCommand("temp", "Posting sementara, otomatis terhapus tiap jam 02:00 WIB"),
     BotCommand("jadwal", "Jadwalkan broadcast (posting terjadwal)"),
     BotCommand("jadwallist", "Lihat daftar broadcast terjadwal"),
     BotCommand("jadwalbatal", "Batalkan broadcast terjadwal"),
@@ -295,11 +298,11 @@ async def _send_broadcast_message(
     caption_md: str | None,
     keyboard: InlineKeyboardMarkup | None,
     thumb_bytes_cache: dict,
-) -> None:
+):
     """Kirim 1 pesan broadcast ke 1 chat, terapkan thumbnail per-kind (channel
-    vs group) kalau relevan. Dipakai bareng oleh /broadcast (langsung) dan
-    run_due_scheduled_broadcasts (/jadwal, tertunda) supaya logikanya sama
-    persis, tidak dobel kode.
+    vs group) kalau relevan. Dipakai bareng oleh /broadcast (langsung),
+    run_due_scheduled_broadcasts (/jadwal, tertunda), dan /temp (broadcast
+    yang auto-hapus) supaya logikanya sama persis, tidak dobel kode.
 
     - source_message_id None -> mode teks polos, tidak ada pesan sumber sama
       sekali (caption_md WAJIB diisi di kasus ini).
@@ -314,32 +317,32 @@ async def _send_broadcast_message(
     thumb_bytes_cache: dict mutable yg dipakai LINTAS PANGGILAN (1 broadcast
     ke banyak chat) supaya video/dokumen/animasi cuma didownload sekali per
     kind, bukan re-download tiap chat_id.
+
+    Return: objek hasil kirim (punya .message_id) -- dipakai /temp buat catat
+    pesan mana yang perlu dihapus otomatis nanti.
     """
     thumb_file_id = thumbs.get(kind) if kind else None
 
     if source_message_id is None:
         # Mode teks polos: tidak ada apa pun yang bisa di-copy.
         if thumb_file_id:
-            await context.bot.send_photo(
+            return await context.bot.send_photo(
                 chat_id, photo=thumb_file_id, caption=caption_md or "",
                 parse_mode=ParseMode.MARKDOWN_V2, reply_markup=keyboard,
             )
-        else:
-            await context.bot.send_message(
-                chat_id, caption_md or "", parse_mode=ParseMode.MARKDOWN_V2,
-                reply_markup=keyboard, disable_web_page_preview=True,
-            )
-        return
+        return await context.bot.send_message(
+            chat_id, caption_md or "", parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=keyboard, disable_web_page_preview=True,
+        )
 
     if thumb_file_id and media_type == "photo" and media_file_id:
-        await context.bot.send_photo(
+        return await context.bot.send_photo(
             chat_id=chat_id,
             photo=thumb_file_id,
             caption=caption_md or None,
             parse_mode=ParseMode.MARKDOWN_V2 if caption_md else None,
             reply_markup=keyboard,
         )
-        return
 
     if thumb_file_id and media_type in PREVIEW_THUMB_MEDIA_TYPES and media_file_id:
         if kind not in thumb_bytes_cache:
@@ -351,7 +354,7 @@ async def _send_broadcast_message(
                 "document": context.bot.send_document,
                 "animation": context.bot.send_animation,
             }[media_type]
-            await sender(
+            return await sender(
                 chat_id=chat_id,
                 **{media_type: media_file_id},
                 thumbnail=thumb_bytes,
@@ -359,11 +362,10 @@ async def _send_broadcast_message(
                 parse_mode=ParseMode.MARKDOWN_V2 if caption_md else None,
                 reply_markup=keyboard,
             )
-            return
         # Gagal download thumbnail -> lanjut ke fallback copy_message di bawah,
         # jangan sampai broadcast gagal total gara-gara thumbnail doang.
 
-    await context.bot.copy_message(
+    return await context.bot.copy_message(
         chat_id=chat_id,
         from_chat_id=source_chat_id,
         message_id=source_message_id,
@@ -1266,17 +1268,10 @@ def parse_schedule_time(spec: str) -> tuple[datetime | None, str | None]:
     return run_at, None
 
 
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not is_admin(user.id):
-        await update.message.reply_text("Perintah ini khusus admin.")
-        return
-
-    replied = update.message.reply_to_message
-
-    # Ambil argumen setelah "/broadcast" dalam 2 bentuk: teks polos (buat cari
-    # baris tombol & validasi URL apa adanya) dan versi MarkdownV2 (biar
-    # bold/underline/dll dari toolbar Telegram tetap kepakai pas dikirim ulang).
+def _parse_broadcast_text_and_buttons(update: Update) -> tuple[str, InlineKeyboardMarkup | None, str | None]:
+    """Parse argumen setelah command (/broadcast atau /temp) jadi
+    (custom_text_markdown, keyboard, error_message). Kalau error_message
+    TIDAK None, pemanggil wajib balas itu ke user dan berhenti di situ."""
     plain_full = update.message.text or ""
     md_full = update.message.text_markdown_v2 or plain_full
 
@@ -1291,13 +1286,12 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # baris terakhir ADA "|" (jelas maksudnya mau bikin tombol) tapi
         # format/URL-nya tidak valid -> kasih tahu, jangan diam-diam
         # dianggap teks biasa.
-        await update.message.reply_text(
+        return "", None, (
             "Format tombol salah. Pastikan tiap baris tombol:\n"
             "<teks tombol> | <url yang valid, diawali http/https>\n"
             "atau dengan warna: <teks tombol> | <url> | <biru/hijau/merah>\n"
             "(pisahkan dengan || kalau mau beberapa tombol sebaris)"
         )
-        return
 
     removed_count = len(plain_lines) - keep_idx
     keyboard = InlineKeyboardMarkup(button_rows) if button_rows else None
@@ -1305,7 +1299,21 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(md_lines) == len(plain_lines) + removed_count:
         md_lines = md_lines[: len(md_lines) - removed_count] if removed_count else md_lines
 
-    custom_text = "\n".join(md_lines).strip()
+    return "\n".join(md_lines).strip(), keyboard, None
+
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Perintah ini khusus admin.")
+        return
+
+    replied = update.message.reply_to_message
+
+    custom_text, keyboard, err = _parse_broadcast_text_and_buttons(update)
+    if err:
+        await update.message.reply_text(err)
+        return
 
     if replied is None:
         # Mode compose langsung: isi postingan diketik setelah /broadcast, tidak
@@ -1379,6 +1387,102 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if replied_media_type not in PREVIEW_THUMB_MEDIA_TYPES and replied_media_type != "photo":
             thumb_note += " (Tidak diterapkan karena tipe media ini tidak didukung.)"
     await update.message.reply_text(f"Broadcast selesai. Sukses: {sent}, Gagal: {failed}{thumb_note}")
+
+
+# ---------------------------------------------------------------------
+# /temp -> sama persis kayak /broadcast (2 mode: reply media, atau tulis
+# teks langsung; dukung thumbnail /thumbch & /thumbgrp juga), BEDANYA:
+# semua pesan yang terkirim lewat /temp dicatat di tabel temp_posts, dan
+# OTOMATIS DIHAPUS dari semua channel/grup tujuan tiap jam 02:00 WIB oleh
+# job "cleanup_temp_posts" (lihat post_init). Postingan biasa dari
+# /broadcast atau /postlink TIDAK ikut kena hapus -- cuma yang lewat /temp.
+# ---------------------------------------------------------------------
+async def temp_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Perintah ini khusus admin.")
+        return
+
+    replied = update.message.reply_to_message
+
+    custom_text, keyboard, err = _parse_broadcast_text_and_buttons(update)
+    if err:
+        await update.message.reply_text(err)
+        return
+
+    if replied is None and not custom_text:
+        await update.message.reply_text(
+            "Reply perintah ini ke pesan yang ingin diposting SEMENTARA (kalau ada "
+            "media), ATAU tulis langsung isi postingannya setelah /temp — boleh "
+            "multi-baris & pakai bold/underline dari toolbar Telegram.\n\n"
+            "⏱️ Bedanya dengan /broadcast: postingan ini OTOMATIS DIHAPUS dari semua "
+            "channel/grup tujuan tiap jam 02:00 WIB. Cocok buat promo/pengumuman "
+            "yang cuma berlaku sehari.\n\n"
+            "Baris terakhir opsional buat tombol:\n<teks tombol> | <url>"
+        )
+        return
+
+    thumbs = pop_pending_thumbs(context, user.id)
+    thumb_bytes_cache: dict[str, bytes | None] = {}
+
+    if replied is not None:
+        media_file_id, media_type = extract_media(replied)
+        caption_md = custom_text or (replied.caption_markdown_v2 or "")
+        source_chat_id, source_message_id = replied.chat_id, replied.message_id
+    else:
+        media_file_id, media_type = None, None
+        caption_md = custom_text
+        source_chat_id, source_message_id = None, None
+
+    sent, failed = 0, 0
+    target_chats = await get_target_chats()
+    for chat in target_chats:
+        chat_id, kind = chat["chat_id"], chat.get("kind")
+        try:
+            result = await _send_broadcast_message(
+                context, chat_id, kind, thumbs,
+                media_type=media_type, media_file_id=media_file_id,
+                source_chat_id=source_chat_id, source_message_id=source_message_id,
+                caption_md=caption_md,
+                keyboard=keyboard,
+                thumb_bytes_cache=thumb_bytes_cache,
+            )
+            await db.add_temp_post(chat_id, result.message_id)
+            sent += 1
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Gagal /temp ke %s: %s", chat_id, e)
+            failed += 1
+
+    thumb_note = ""
+    if thumbs.get("channel") or thumbs.get("group"):
+        thumb_note = "\n(Thumbnail channel/grup yang di-set sudah terpakai & ke-reset.)"
+
+    await update.message.reply_text(
+        f"⏱️ Posting sementara terkirim. Sukses: {sent}, Gagal: {failed}\n"
+        f"Otomatis dihapus dari semua tujuan jam 02:00 WIB.{thumb_note}"
+    )
+
+
+async def cleanup_temp_posts(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Dijalankan tiap hari jam 02:00 WIB (lihat post_init) -- hapus semua
+    pesan yang pernah dikirim lewat /temp dari channel/grup tujuannya."""
+    posts = await db.get_all_temp_posts()
+    if not posts:
+        return
+
+    ok, failed = 0, 0
+    for p in posts:
+        try:
+            await context.bot.delete_message(chat_id=p["chat_id"], message_id=p["message_id"])
+            ok += 1
+        except TelegramError as e:
+            # Wajar gagal kalau pesannya udah kehapus manual duluan, atau bot
+            # udah bukan admin lagi di situ -- tetap lanjut, jangan berhenti.
+            logger.warning("Gagal hapus temp post %s di %s: %s", p["message_id"], p["chat_id"], e)
+            failed += 1
+
+    await db.delete_temp_post_rows([p["id"] for p in posts])
+    logger.info("Cleanup /temp jam 02:00 WIB selesai: %s terhapus, %s gagal.", ok, failed)
 
 
 # ---------------------------------------------------------------------
@@ -1723,9 +1827,12 @@ async def post_init(application: Application) -> None:
         application.job_queue.run_repeating(
             run_due_scheduled_broadcasts, interval=30, first=10, name="scheduled_broadcasts"
         )
+        application.job_queue.run_daily(
+            cleanup_temp_posts, time=dt_time(2, 0, tzinfo=WIB), name="cleanup_temp_posts"
+        )
     else:
         logger.warning(
-            "job_queue tidak aktif -- /jadwal tidak akan pernah tereksekusi. "
+            "job_queue tidak aktif -- /jadwal & /temp tidak akan pernah tereksekusi. "
             "Pastikan 'python-telegram-bot[job-queue]' terpasang."
         )
 
@@ -1781,6 +1888,7 @@ def main() -> None:
     app.add_handler(CommandHandler(["listmedia", "lm"], listmedia))
     app.add_handler(CommandHandler(["cari", "cr"], cari))
     app.add_handler(CommandHandler(["broadcast", "br"], broadcast))
+    app.add_handler(CommandHandler(["temp"], temp_broadcast))
     app.add_handler(CommandHandler(["jadwal", "jd"], jadwal))
     app.add_handler(CommandHandler(["jadwallist", "jl"], jadwallist))
     app.add_handler(CommandHandler(["jadwalbatal", "jb"], jadwalbatal))
