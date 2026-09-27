@@ -114,6 +114,21 @@ async def init_db() -> None:
             "ON scheduled_broadcasts (run_at) WHERE status = 'pending'"
         )
 
+        # Pesan hasil /temp -- dicatat di sini supaya bisa dihapus otomatis
+        # tiap jam 02:00 WIB (lihat job "cleanup_temp_posts"). Disimpan
+        # permanen (bukan cuma di memori) supaya tetap ke-hapus walau bot
+        # sempat restart/redeploy sebelum jam 02:00 tiba.
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS temp_posts (
+                id SERIAL PRIMARY KEY,
+                chat_id BIGINT NOT NULL,
+                message_id BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+
 
 async def close_db() -> None:
     global _pool
@@ -359,3 +374,34 @@ async def cancel_scheduled_broadcast(id_: int) -> bool:
             id_,
         )
         return result.split()[-1] != "0"
+
+
+# ---------------------------------------------------------------------
+# /temp -- broadcast sementara yang auto-hapus tiap jam 02:00 WIB
+# ---------------------------------------------------------------------
+async def add_temp_post(chat_id: int, message_id: int) -> None:
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO temp_posts (chat_id, message_id) VALUES ($1, $2)",
+            chat_id, message_id,
+        )
+
+
+async def get_all_temp_posts() -> list[dict]:
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("SELECT id, chat_id, message_id FROM temp_posts ORDER BY id")
+        return [dict(r) for r in rows]
+
+
+async def delete_temp_post_rows(ids: list[int]) -> None:
+    """Hapus baris catatan (bukan pesan Telegram-nya -- itu urusan bot.py)
+    setelah selesai diproses, sukses ataupun gagal dihapus dari Telegram."""
+    if not ids:
+        return
+    async with _pool.acquire() as conn:
+        await conn.execute("DELETE FROM temp_posts WHERE id = ANY($1::int[])", ids)
+
+
+async def count_temp_posts() -> int:
+    async with _pool.acquire() as conn:
+        return await conn.fetchval("SELECT COUNT(*) FROM temp_posts")
