@@ -236,6 +236,30 @@ Catatan:
   tersimpan permanen bareng jadwalnya (aman walau bot sempat restart sebelum
   waktunya tiba).
 
+### Broadcast sementara (auto-hapus jam 02:00 WIB)
+Kalau postingannya cuma berlaku sehari (promo harian, pengumuman jadwal
+tayang, dll) dan kamu males hapus manual satu-satu — pakai `/temp` sebagai
+ganti `/broadcast`. Formatnya **sama persis** kayak `/broadcast` (2 mode:
+reply media, atau tulis teks langsung), dan `/thumbch`/`/thumbgrp` tetap
+berlaku juga di sini:
+
+```
+(reply ke foto/video) /temp
+✨ Promo Hari Ini ✨
+
+▶️ Tonton | https://t.me/NamaBot?start=get_KODE
+```
+
+Bedanya cuma satu: **semua pesan yang terkirim lewat `/temp` otomatis
+dihapus dari semua channel/grup tujuan tiap jam 02:00 WIB**, tanpa perlu
+kamu hapus manual. Postingan dari `/broadcast` atau `/postlink` biasa
+**tidak** ikut kehapus — cuma yang lewat `/temp` yang kena.
+
+Catatan: penghapusan ini butuh bot masih jadi admin di channel/grup itu
+(sama kayak syarat kirim biasa), dan tersimpan di database — jadi tetap
+aman kehapus sesuai jadwalnya walau bot sempat restart/redeploy di
+antara waktu posting dan jam 02:00.
+
 ### Mengatur TARGET_CHATS / REQUIRED_CHATS langsung dari chat
 Gak perlu lagi bolak-balik ke Railway Variables setiap mau ganti channel
 tujuan broadcast atau channel wajib-join — admin bisa atur langsung:
@@ -265,8 +289,8 @@ Saat user ketik `/` di chat bot, menu yang muncul otomatis berbeda:
 - **Admin** (sesuai `ADMIN_IDS`) melihat semua command: `/genlink`,
   `/store`, `/postlink`, `/thumbch`, `/thumbgrp`, `/link`, `/batchstart`,
   `/batchstatus`, `/batchdone`, `/batchcancel`, `/delmedia`, `/listmedia`,
-  `/cari`, `/broadcast`, `/setvars`, `/delvars`, `/getvars`, `/jadwal`,
-  `/jadwallist`, `/jadwalbatal`, `/ping`, `/start`.
+  `/cari`, `/broadcast`, `/temp`, `/setvars`, `/delvars`, `/getvars`,
+  `/jadwal`, `/jadwallist`, `/jadwalbatal`, `/ping`, `/start`.
 
 Ini murni soal tampilan menu supaya rapi — semua command admin **tetap**
 dicek lewat `is_admin()` di kode, jadi member yang tahu nama command-nya
