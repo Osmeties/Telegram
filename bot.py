@@ -100,6 +100,8 @@ ADMIN_COMMANDS = PUBLIC_COMMANDS + [
     BotCommand("getvars", "Untuk mendapatkan daftar variabel"),
     BotCommand("broadcast", "Untuk mengirimkan pesan ke channel/grup"),
     BotCommand("temp", "Posting sementara, otomatis terhapus tiap jam 02:00 WIB"),
+    BotCommand("tempch", "Sama seperti /temp, tapi cuma ke channel (kind=channel)"),
+    BotCommand("tempgrp", "Sama seperti /temp, tapi cuma ke grup (kind=group)"),
     BotCommand("jadwal", "Jadwalkan broadcast (posting terjadwal)"),
     BotCommand("jadwallist", "Lihat daftar broadcast terjadwal"),
     BotCommand("jadwalbatal", "Batalkan broadcast terjadwal"),
@@ -160,7 +162,13 @@ async def get_required_chats() -> list[dict]:
 # Cek wajib-join
 # ---------------------------------------------------------------------
 async def get_missing_chats(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> list[dict]:
-    """Kembalikan daftar REQUIRED_CHATS (efektif) yang BELUM di-join user."""
+    """Kembalikan daftar REQUIRED_CHATS (efektif) yang BELUM di-join user.
+
+    Admin (ADMIN_IDS) selalu lolos tanpa dicek: admin yang jadi "anonymous
+    admin" di grup tidak terbaca sebagai member oleh getChatMember, jadi
+    kalau tetap dicek admin sendiri malah terkunci dari konten."""
+    if is_admin(user_id):
+        return []
     required = await get_required_chats()
     missing = []
     for chat in required:
@@ -870,7 +878,12 @@ async def check_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if missing:
         await query.answer("Masih ada channel/grup yang belum kamu join 🙏", show_alert=True)
-        await query.edit_message_reply_markup(reply_markup=build_join_keyboard(missing, code))
+        try:
+            await query.edit_message_reply_markup(reply_markup=build_join_keyboard(missing, code))
+        except TelegramError as e:
+            # Tombol sama persis dengan sebelumnya -> Telegram tolak edit. Aman diabaikan.
+            if "not modified" not in str(e).lower():
+                raise
         return
 
     await query.answer("Verifikasi berhasil ✅")
@@ -1397,7 +1410,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # job "cleanup_temp_posts" (lihat post_init). Postingan biasa dari
 # /broadcast atau /postlink TIDAK ikut kena hapus -- cuma yang lewat /temp.
 # ---------------------------------------------------------------------
-async def temp_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def temp_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, scope: str | None = None) -> None:
     user = update.effective_user
     if not is_admin(user.id):
         await update.message.reply_text("Perintah ini khusus admin.")
@@ -1411,16 +1424,26 @@ async def temp_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if replied is None and not custom_text:
+        scope_label = {"channel": " (khusus channel)", "group": " (khusus grup)"}.get(scope, "")
         await update.message.reply_text(
-            "Reply perintah ini ke pesan yang ingin diposting SEMENTARA (kalau ada "
-            "media), ATAU tulis langsung isi postingannya setelah /temp — boleh "
-            "multi-baris & pakai bold/underline dari toolbar Telegram.\n\n"
-            "⏱️ Bedanya dengan /broadcast: postingan ini OTOMATIS DIHAPUS dari semua "
-            "channel/grup tujuan tiap jam 02:00 WIB. Cocok buat promo/pengumuman "
-            "yang cuma berlaku sehari.\n\n"
+            f"Reply perintah ini{scope_label} ke pesan yang ingin diposting SEMENTARA "
+            "(kalau ada media), ATAU tulis langsung isi postingannya setelah command — "
+            "boleh multi-baris & pakai bold/underline dari toolbar Telegram.\n\n"
+            "⏱️ Bedanya dengan /broadcast: postingan ini OTOMATIS DIHAPUS dari tujuan "
+            "tiap jam 02:00 WIB. Cocok buat promo/pengumuman yang cuma berlaku sehari.\n\n"
             "Baris terakhir opsional buat tombol:\n<teks tombol> | <url>"
         )
         return
+
+    target_chats = await get_target_chats()
+    if scope:
+        target_chats = [c for c in target_chats if c.get("kind") == scope]
+        if not target_chats:
+            await update.message.reply_text(
+                f'⚠️ Tidak ada TARGET_CHATS dengan kind="{scope}". Cek /getvars atau '
+                "migrasi dulu lewat /setvars TARGET_CHATS."
+            )
+            return
 
     thumbs = pop_pending_thumbs(context, user.id)
     thumb_bytes_cache: dict[str, bytes | None] = {}
@@ -1435,7 +1458,6 @@ async def temp_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         source_chat_id, source_message_id = None, None
 
     sent, failed = 0, 0
-    target_chats = await get_target_chats()
     for chat in target_chats:
         chat_id, kind = chat["chat_id"], chat.get("kind")
         try:
@@ -1457,10 +1479,21 @@ async def temp_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if thumbs.get("channel") or thumbs.get("group"):
         thumb_note = "\n(Thumbnail channel/grup yang di-set sudah terpakai & ke-reset.)"
 
+    scope_note = {"channel": " ke channel", "group": " ke grup"}.get(scope, "")
     await update.message.reply_text(
-        f"⏱️ Posting sementara terkirim. Sukses: {sent}, Gagal: {failed}\n"
-        f"Otomatis dihapus dari semua tujuan jam 02:00 WIB.{thumb_note}"
+        f"⏱️ Posting sementara terkirim{scope_note}. Sukses: {sent}, Gagal: {failed}\n"
+        f"Otomatis dihapus jam 02:00 WIB.{thumb_note}"
     )
+
+
+async def temp_broadcast_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/tempch -- sama seperti /temp, tapi cuma ke TARGET_CHATS berkind "channel"."""
+    await temp_broadcast(update, context, scope="channel")
+
+
+async def temp_broadcast_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/tempgrp -- sama seperti /temp, tapi cuma ke TARGET_CHATS berkind "group"."""
+    await temp_broadcast(update, context, scope="group")
 
 
 async def cleanup_temp_posts(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1889,6 +1922,8 @@ def main() -> None:
     app.add_handler(CommandHandler(["cari", "cr"], cari))
     app.add_handler(CommandHandler(["broadcast", "br"], broadcast))
     app.add_handler(CommandHandler(["temp"], temp_broadcast))
+    app.add_handler(CommandHandler(["tempch"], temp_broadcast_channel))
+    app.add_handler(CommandHandler(["tempgrp", "tempgroup"], temp_broadcast_group))
     app.add_handler(CommandHandler(["jadwal", "jd"], jadwal))
     app.add_handler(CommandHandler(["jadwallist", "jl"], jadwallist))
     app.add_handler(CommandHandler(["jadwalbatal", "jb"], jadwalbatal))
