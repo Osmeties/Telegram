@@ -260,6 +260,18 @@ Catatan: penghapusan ini butuh bot masih jadi admin di channel/grup itu
 aman kehapus sesuai jadwalnya walau bot sempat restart/redeploy di
 antara waktu posting dan jam 02:00.
 
+Mau `/temp` cuma ke **channel** saja (skip semua grup), atau cuma ke
+**grup** saja (skip semua channel)? Pakai varian ini, formatnya sama
+persis — cuma nama command-nya beda:
+```
+/tempch   -> kirim sementara ke TARGET_CHATS yang kind="channel" saja
+/tempgrp  -> kirim sementara ke TARGET_CHATS yang kind="group" saja
+```
+Ini butuh `TARGET_CHATS` sudah dimigrasi ke format `kind` (lihat bagian
+"Mengatur TARGET_CHATS" di bawah) — kalau ada entri yang `kind`-nya belum
+di-set, entri itu otomatis di-skip oleh `/tempch`/`/tempgrp` (tidak dianggap
+channel maupun grup).
+
 ### Mengatur TARGET_CHATS / REQUIRED_CHATS langsung dari chat
 Gak perlu lagi bolak-balik ke Railway Variables setiap mau ganti channel
 tujuan broadcast atau channel wajib-join — admin bisa atur langsung:
@@ -289,8 +301,9 @@ Saat user ketik `/` di chat bot, menu yang muncul otomatis berbeda:
 - **Admin** (sesuai `ADMIN_IDS`) melihat semua command: `/genlink`,
   `/store`, `/postlink`, `/thumbch`, `/thumbgrp`, `/link`, `/batchstart`,
   `/batchstatus`, `/batchdone`, `/batchcancel`, `/delmedia`, `/listmedia`,
-  `/cari`, `/broadcast`, `/temp`, `/setvars`, `/delvars`, `/getvars`,
-  `/jadwal`, `/jadwallist`, `/jadwalbatal`, `/ping`, `/start`.
+  `/cari`, `/broadcast`, `/temp`, `/tempch`, `/tempgrp`, `/setvars`,
+  `/delvars`, `/getvars`, `/jadwal`, `/jadwallist`, `/jadwalbatal`,
+  `/ping`, `/start`.
 
 Ini murni soal tampilan menu supaya rapi — semua command admin **tetap**
 dicek lewat `is_admin()` di kode, jadi member yang tahu nama command-nya
