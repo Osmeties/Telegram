@@ -114,6 +114,14 @@ async def init_db() -> None:
             "ON scheduled_broadcasts (run_at) WHERE status = 'pending'"
         )
 
+        # Dukungan /jdtemp, /jdtempch, /jdtempgrp -- versi terjadwal dari
+        # /temp, /tempch, /tempgrp. is_temp menandai jadwal ini perlu dicatat
+        # ke temp_posts (auto-hapus jam 02:00 WIB) pas dieksekusi nanti;
+        # target_kind membatasi ke TARGET_CHATS "channel"/"group" saja (NULL
+        # = semua, perilaku /jadwal yang sudah ada).
+        await conn.execute("ALTER TABLE scheduled_broadcasts ADD COLUMN IF NOT EXISTS is_temp BOOLEAN NOT NULL DEFAULT FALSE")
+        await conn.execute("ALTER TABLE scheduled_broadcasts ADD COLUMN IF NOT EXISTS target_kind TEXT")
+
         # Pesan hasil /temp -- dicatat di sini supaya bisa dihapus otomatis
         # tiap jam 02:00 WIB (lihat job "cleanup_temp_posts"). Disimpan
         # permanen (bukan cuma di memori) supaya tetap ke-hapus walau bot
@@ -298,20 +306,28 @@ async def create_scheduled_broadcast(
     media_file_id: str | None = None,
     media_type: str | None = None,
     source_caption: str | None = None,
+    is_temp: bool = False,
+    target_kind: str | None = None,
 ) -> int:
+    """is_temp: kalau True, pas dieksekusi nanti pesannya dicatat ke
+    temp_posts (ikut auto-hapus jam 02:00 WIB, lihat cleanup_temp_posts).
+    target_kind: None = semua TARGET_CHATS, "channel"/"group" = cuma yg
+    kind-nya itu (persis seperti /tempch, /tempgrp tapi versi terjadwal)."""
     async with _pool.acquire() as conn:
         row = await conn.fetchrow(
             """
             INSERT INTO scheduled_broadcasts
                 (created_by, run_at, text, button_spec, source_chat_id, source_message_id,
-                 thumb_channel_file_id, thumb_group_file_id, media_file_id, media_type, source_caption)
-            VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11)
+                 thumb_channel_file_id, thumb_group_file_id, media_file_id, media_type,
+                 source_caption, is_temp, target_kind)
+            VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             RETURNING id
             """,
             created_by, run_at, text,
             json.dumps(button_spec) if button_spec else None,
             source_chat_id, source_message_id,
             thumb_channel_file_id, thumb_group_file_id, media_file_id, media_type, source_caption,
+            is_temp, target_kind,
         )
         return row["id"]
 
@@ -322,7 +338,8 @@ async def get_due_scheduled_broadcasts(now) -> list[dict]:
         rows = await conn.fetch(
             """
             SELECT id, created_by, run_at, text, button_spec, source_chat_id, source_message_id,
-                   thumb_channel_file_id, thumb_group_file_id, media_file_id, media_type, source_caption
+                   thumb_channel_file_id, thumb_group_file_id, media_file_id, media_type, source_caption,
+                   is_temp, target_kind
             FROM scheduled_broadcasts
             WHERE status = 'pending' AND run_at <= $1
             ORDER BY run_at
