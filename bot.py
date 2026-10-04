@@ -103,6 +103,9 @@ ADMIN_COMMANDS = PUBLIC_COMMANDS + [
     BotCommand("tempch", "Sama seperti /temp, tapi cuma ke channel (kind=channel)"),
     BotCommand("tempgrp", "Sama seperti /temp, tapi cuma ke grup (kind=group)"),
     BotCommand("jadwal", "Jadwalkan broadcast (posting terjadwal)"),
+    BotCommand("jdtemp", "Jadwalkan posting sementara (auto-hapus 02:00 WIB)"),
+    BotCommand("jdtempch", "Sama seperti /jdtemp, tapi cuma ke channel"),
+    BotCommand("jdtempgrp", "Sama seperti /jdtemp, tapi cuma ke grup"),
     BotCommand("jadwallist", "Lihat daftar broadcast terjadwal"),
     BotCommand("jadwalbatal", "Batalkan broadcast terjadwal"),
 ]
@@ -1524,7 +1527,18 @@ async def cleanup_temp_posts(context: ContextTypes.DEFAULT_TYPE) -> None:
 # tetap jalan walau bot sempat restart sebelum waktunya tiba -- job
 # run_due_scheduled_broadcasts yang jalan tiap 30 detik yang mengeksekusi.
 # ---------------------------------------------------------------------
-async def jadwal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _jadwal_core(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    command_name: str,
+    is_temp: bool,
+    target_kind: str | None,
+) -> None:
+    """Inti dari /jadwal, /jdtemp, /jdtempch, /jdtempgrp -- satu-satunya
+    bedanya cuma is_temp (dicatat ke temp_posts & kena auto-hapus 02:00 WIB
+    kayak /temp) dan target_kind (batasi ke "channel"/"group" saja, kayak
+    /tempch /tempgrp -- None berarti semua TARGET_CHATS)."""
     user = update.effective_user
     if not is_admin(user.id):
         await update.message.reply_text("Perintah ini khusus admin.")
@@ -1536,13 +1550,21 @@ async def jadwal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     plain_parts = plain_full.split(None, 1)
     if len(plain_parts) < 2:
+        temp_hint = (
+            "\n\n⏱️ Jadwal ini bersifat SEMENTARA -- otomatis terhapus dari tujuannya "
+            "tiap jam 02:00 WIB setelah dikirim." if is_temp else ""
+        )
+        scope_hint = {
+            "channel": " (cuma ke TARGET_CHATS berkind \"channel\")",
+            "group": " (cuma ke TARGET_CHATS berkind \"group\")",
+        }.get(target_kind, "")
         await update.message.reply_text(
-            "Format:\n/jadwal <DD-MM-YYYY HH:MM atau HH:MM>\n<isi postingan...>\n\n"
+            f"Format:\n/{command_name} <DD-MM-YYYY HH:MM atau HH:MM>\n<isi postingan...>{scope_hint}\n\n"
             "Waktu WIB, harus di baris PERTAMA sendirian. Contoh:\n"
-            "/jadwal 30-08-2026 20:00\nJudul Film\n\n"
+            f"/{command_name} 30-08-2026 20:00\nJudul Film\n\n"
             "▶️ Putar Video | https://t.me/NamaBot?start=get_KODE\n\n"
             "Atau reply ke media/pesan yang mau dijadwalkan (isi teks di bawah "
-            "waktu jadi caption/override-nya, opsional)."
+            f"waktu jadi caption/override-nya, opsional).{temp_hint}"
         )
         return
 
@@ -1604,16 +1626,35 @@ async def jadwal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         media_file_id=media_file_id,
         media_type=media_type,
         source_caption=source_caption_md,
+        is_temp=is_temp,
+        target_kind=target_kind,
     )
 
     thumb_note = ""
     if thumbs.get("channel") or thumbs.get("group"):
         thumb_note = "\n(Thumbnail channel/grup yang di-set ikut tersimpan buat jadwal ini.)"
+    temp_note = "\n⏱️ Otomatis terhapus jam 02:00 WIB setelah dikirim." if is_temp else ""
     await update.message.reply_text(
         f"📅 Terjadwal (#{sched_id}) — {run_at_wib.strftime('%d-%m-%Y %H:%M')} WIB.\n"
         f"Lihat semua: /jadwallist\n"
-        f"Batalkan: /jadwalbatal {sched_id}{thumb_note}"
+        f"Batalkan: /jadwalbatal {sched_id}{thumb_note}{temp_note}"
     )
+
+
+async def jadwal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _jadwal_core(update, context, command_name="jadwal", is_temp=False, target_kind=None)
+
+
+async def jadwal_temp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _jadwal_core(update, context, command_name="jdtemp", is_temp=True, target_kind=None)
+
+
+async def jadwal_temp_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _jadwal_core(update, context, command_name="jdtempch", is_temp=True, target_kind="channel")
+
+
+async def jadwal_temp_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _jadwal_core(update, context, command_name="jdtempgrp", is_temp=True, target_kind="group")
 
 
 def strip_markdown_v2_escapes(text: str) -> str:
@@ -1676,18 +1717,24 @@ async def run_due_scheduled_broadcasts(context: ContextTypes.DEFAULT_TYPE) -> No
     if not due:
         return
 
-    target_chats = await get_target_chats()
+    all_target_chats = await get_target_chats()
     for item in due:
         keyboard = spec_to_keyboard(item["button_spec"])
         caption_md = item["text"] or item["source_caption"]
         thumbs = {"channel": item["thumb_channel_file_id"], "group": item["thumb_group_file_id"]}
         thumb_bytes_cache: dict[str, bytes | None] = {}
 
+        target_kind = item.get("target_kind")
+        target_chats = (
+            [c for c in all_target_chats if c.get("kind") == target_kind]
+            if target_kind else all_target_chats
+        )
+
         sent, failed = 0, 0
         for chat in target_chats:
             chat_id, kind = chat["chat_id"], chat.get("kind")
             try:
-                await _send_broadcast_message(
+                result = await _send_broadcast_message(
                     context, chat_id, kind, thumbs,
                     media_type=item["media_type"], media_file_id=item["media_file_id"],
                     source_chat_id=item["source_chat_id"], source_message_id=item["source_message_id"],
@@ -1695,6 +1742,8 @@ async def run_due_scheduled_broadcasts(context: ContextTypes.DEFAULT_TYPE) -> No
                     keyboard=keyboard,
                     thumb_bytes_cache=thumb_bytes_cache,
                 )
+                if item.get("is_temp"):
+                    await db.add_temp_post(chat_id, result.message_id)
                 sent += 1
             except Exception as e:  # noqa: BLE001
                 logger.warning("Gagal jalankan broadcast terjadwal #%s ke %s: %s", item["id"], chat_id, e)
@@ -1702,10 +1751,11 @@ async def run_due_scheduled_broadcasts(context: ContextTypes.DEFAULT_TYPE) -> No
 
         await db.mark_scheduled_broadcast(item["id"], "sent" if sent > 0 else "failed")
 
+        temp_tag = " (sementara, kena auto-hapus 02:00 WIB)" if item.get("is_temp") else ""
         try:
             await context.bot.send_message(
                 item["created_by"],
-                f"📅 Broadcast terjadwal #{item['id']} sudah dijalankan. "
+                f"📅 Broadcast terjadwal #{item['id']}{temp_tag} sudah dijalankan. "
                 f"Sukses: {sent}, Gagal: {failed}",
             )
         except TelegramError:
@@ -1925,6 +1975,9 @@ def main() -> None:
     app.add_handler(CommandHandler(["tempch"], temp_broadcast_channel))
     app.add_handler(CommandHandler(["tempgrp", "tempgroup"], temp_broadcast_group))
     app.add_handler(CommandHandler(["jadwal", "jd"], jadwal))
+    app.add_handler(CommandHandler(["jdtemp"], jadwal_temp))
+    app.add_handler(CommandHandler(["jdtempch"], jadwal_temp_channel))
+    app.add_handler(CommandHandler(["jdtempgrp", "jdtempgroup"], jadwal_temp_group))
     app.add_handler(CommandHandler(["jadwallist", "jl"], jadwallist))
     app.add_handler(CommandHandler(["jadwalbatal", "jb"], jadwalbatal))
     app.add_handler(CommandHandler(["setvars", "sv"], setvars))
