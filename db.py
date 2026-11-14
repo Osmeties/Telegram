@@ -43,6 +43,9 @@ async def init_db() -> None:
         # Migrasi utk instalasi lama: kolom "items" (array media, dipakai utk
         # batch/album) belum ada dulu, dan file_id/media_type dulunya NOT NULL.
         await conn.execute("ALTER TABLE media ADD COLUMN IF NOT EXISTS items JSONB")
+        # Dukungan /vaultsync -- NULL berarti belum pernah di-backup ke
+        # channel/grup brankas; diisi timestamp begitu berhasil.
+        await conn.execute("ALTER TABLE media ADD COLUMN IF NOT EXISTS vault_synced_at TIMESTAMPTZ")
         await conn.execute("ALTER TABLE media ALTER COLUMN file_id DROP NOT NULL")
         await conn.execute("ALTER TABLE media ALTER COLUMN media_type DROP NOT NULL")
         # Isi "items" utk baris lama yang dibuat sebelum kolom ini ada, supaya
@@ -422,3 +425,43 @@ async def delete_temp_post_rows(ids: list[int]) -> None:
 async def count_temp_posts() -> int:
     async with _pool.acquire() as conn:
         return await conn.fetchval("SELECT COUNT(*) FROM temp_posts")
+
+
+# ---------------------------------------------------------------------
+# /vaultsync -- backup salinan media ke channel/grup brankas
+# ---------------------------------------------------------------------
+async def get_unsynced_media() -> list[dict]:
+    """Kode yang belum pernah di-backup ke brankas (vault_synced_at NULL),
+    terlama dulu (biar backlog lama kebagian duluan)."""
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT code, items, file_id, media_type, caption
+            FROM media
+            WHERE vault_synced_at IS NULL
+            ORDER BY created_at ASC
+            """
+        )
+        result = []
+        for r in rows:
+            d = dict(r)
+            items = d["items"]
+            if items and isinstance(items, str):
+                items = json.loads(items)
+            elif not items:
+                items = [{"file_id": d["file_id"], "media_type": d["media_type"]}]
+            d["items"] = items
+            result.append(d)
+        return result
+
+
+async def mark_media_vault_synced(code: str) -> None:
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE media SET vault_synced_at = now() WHERE code = $1", code
+        )
+
+
+async def count_unsynced_media() -> int:
+    async with _pool.acquire() as conn:
+        return await conn.fetchval("SELECT COUNT(*) FROM media WHERE vault_synced_at IS NULL")
