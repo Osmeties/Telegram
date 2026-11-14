@@ -34,7 +34,14 @@ ADMIN_IDS = [int(x) for x in _admin_ids_env.split(",") if x.strip()] or [
 #                  {"chat_id": -1002222222222, "kind": "group"}]
 _target_chats_env = os.environ.get("TARGET_CHATS", "")
 if _target_chats_env:
-    TARGET_CHATS = json.loads(_target_chats_env)
+    # Terima 2 format: JSON (format baru, dengan "kind") ATAU angka dipisah
+    # koma (format lama, mis. "-1001,-1002"). Format lama dibaca apa adanya
+    # (tanpa kind) supaya bot tidak crash saat start; bot.py yang
+    # menormalkannya jadi dict dengan kind=None.
+    try:
+        TARGET_CHATS = json.loads(_target_chats_env)
+    except json.JSONDecodeError:
+        TARGET_CHATS = [int(x) for x in _target_chats_env.split(",") if x.strip()]
 else:
     TARGET_CHATS = [
         {"chat_id": -1001234567890, "kind": "channel"},  # ganti dengan chat_id channel kamu
