@@ -18,7 +18,12 @@ Fitur:
               berbeda ke channel vs grup (sesuai "kind" tiap entri di
               TARGET_CHATS), dipakai otomatis di /postlink, /broadcast, atau
               /temp berikutnya lalu langsung ke-reset.
-5. /setvars, /delvars, /getvars -> admin atur TARGET_CHATS & REQUIRED_CHATS
+4d. /vaultsync -> backup semua kode media yang belum di-forward ke
+              VAULT_CHAT_ID (channel/grup brankas). Kode baru otomatis
+              ke-forward sendiri pas disimpan (lihat save_media_and_vault),
+              /vaultsync ini buat backlog lama & yang gagal ke-forward.
+5. /setvars, /delvars, /getvars -> admin atur TARGET_CHATS, REQUIRED_CHATS,
+              & VAULT_CHAT_ID
               langsung dari chat, tanpa perlu ubah Railway Variables.
               Nilai ini disimpan di database dan menimpa nilai default dari
               config.py/Railway Variables selama belum dihapus (/delvars).
@@ -65,7 +70,7 @@ from telegram.ext import (
 )
 
 import db
-from config import BOT_TOKEN, ADMIN_IDS, TARGET_CHATS, REQUIRED_CHATS
+from config import BOT_TOKEN, ADMIN_IDS, TARGET_CHATS, REQUIRED_CHATS, VAULT_CHAT_ID
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -74,7 +79,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Key yang boleh diatur lewat /setvars, /delvars, /getvars
-KNOWN_VAR_KEYS = ["TARGET_CHATS", "REQUIRED_CHATS"]
+KNOWN_VAR_KEYS = ["TARGET_CHATS", "REQUIRED_CHATS", "VAULT_CHAT_ID"]
 
 PUBLIC_COMMANDS = [
     BotCommand("start", "Mulai bot"),
@@ -98,6 +103,7 @@ ADMIN_COMMANDS = PUBLIC_COMMANDS + [
     BotCommand("setvars", "Untuk mengatur variabel"),
     BotCommand("delvars", "Untuk menghapus variabel"),
     BotCommand("getvars", "Untuk mendapatkan daftar variabel"),
+    BotCommand("vaultsync", "Backup semua media yang belum ter-sync ke channel brankas"),
     BotCommand("broadcast", "Untuk mengirimkan pesan ke channel/grup"),
     BotCommand("temp", "Posting sementara, otomatis terhapus tiap jam 02:00 WIB"),
     BotCommand("tempch", "Sama seperti /temp, tapi cuma ke channel (kind=channel)"),
@@ -118,6 +124,48 @@ def is_admin(user_id: int) -> bool:
 # ---------------------------------------------------------------------
 # Nilai efektif TARGET_CHATS / REQUIRED_CHATS (DB override > config/env)
 # ---------------------------------------------------------------------
+async def get_vault_chat_id() -> int | None:
+    val = await db.get_setting("VAULT_CHAT_ID")
+    if val:
+        try:
+            parsed = int(val)
+        except ValueError:
+            return VAULT_CHAT_ID
+        return parsed or None
+    return VAULT_CHAT_ID
+
+
+async def vault_backup_code(
+    context: ContextTypes.DEFAULT_TYPE, code: str, items: list[dict], caption: str | None
+) -> bool:
+    """Forward salinan 1 kode media ke channel/grup brankas (VAULT_CHAT_ID),
+    didahului 1 pesan penanda biar kelihatan kode apa pas dibuka manual nanti.
+    Return False kalau VAULT_CHAT_ID belum di-set atau pengiriman gagal
+    (ditelan di sini -- backup gagal tidak boleh sampai gagalkan proses
+    simpan media yang utama)."""
+    vault_chat_id = await get_vault_chat_id()
+    if not vault_chat_id:
+        return False
+    try:
+        await context.bot.send_message(vault_chat_id, f"📦 KODE: {code} ({len(items)} item)")
+        ok, _ = await _send_media_items(context, vault_chat_id, items, caption)
+        return ok
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Gagal vault-backup kode %s: %s", code, e)
+        return False
+
+
+async def save_media_and_vault(
+    context: ContextTypes.DEFAULT_TYPE, code: str, items: list[dict], caption: str | None
+) -> None:
+    """Simpan media seperti biasa (db.save_media), lalu kalau VAULT_CHAT_ID
+    di-set, langsung forward salinannya ke brankas & tandai tersinkron --
+    supaya ke depannya tidak perlu /vaultsync manual tiap ada kode baru."""
+    await db.save_media(code, items, caption)
+    if await vault_backup_code(context, code, items, caption):
+        await db.mark_media_vault_synced(code)
+
+
 def _normalize_target_chats(raw: list) -> list[dict]:
     """Terima TARGET_CHATS dalam bentuk apa pun -- list of dict (format baru),
     list of int (format lama / belum di-migrasi), atau kosong -- dan SELALU
@@ -596,7 +644,7 @@ async def batchdone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     code = session["code"]
-    await db.save_media(code, session["items"], session["caption"])
+    await save_media_and_vault(context, code, session["items"], session["caption"])
     del sessions[user.id]
 
     bot_username = (await context.bot.get_me()).username
@@ -643,7 +691,9 @@ def get_replied_media_items(replied, context: ContextTypes.DEFAULT_TYPE) -> tupl
 #   bukan bug fatal, cuma keterbatasan JobQueue yang disimpan di memori).
 # ---------------------------------------------------------------------
 AUTO_DELETE_SECONDS = 2 * 60 * 60  # 2 jam
-PROTECT_CONTENT = True
+# False = member BOLEH forward & simpan media (auto-hapus 2 jam tetap jalan).
+# Ganti ke True kalau suatu saat mau proteksi forward/simpan dinyalakan lagi.
+PROTECT_CONTENT = False
 
 WIB = timezone(timedelta(hours=7))
 
@@ -688,10 +738,105 @@ def schedule_auto_delete(context: ContextTypes.DEFAULT_TYPE, chat_id: int, messa
         )
 
 
+async def _send_media_items(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    items: list[dict],
+    caption: str | None,
+    *,
+    protect_content: bool = False,
+) -> tuple[bool, list[int]]:
+    """Kirim 1..N item media (dari kolom "items" tabel media) ke 1 chat --
+    1 item dikirim biasa, lebih dari 1 dikirim sebagai album (dipecah 10-10
+    sesuai batas Telegram, dengan jeda antar-chunk). Dipakai bareng oleh
+    deliver_media (kirim ke user yang klik deep-link) dan vault_sync_code
+    (backup ke channel brankas) supaya logikanya sama persis.
+
+    Return (ok, sent_message_ids). ok=False kalau item pertama tipenya tidak
+    didukung sama sekali (caller yang tentuin pesan errornya)."""
+    send_map = {
+        "photo": context.bot.send_photo,
+        "video": context.bot.send_video,
+        "document": context.bot.send_document,
+        "animation": context.bot.send_animation,
+    }
+    sent_message_ids: list[int] = []
+
+    if len(items) == 1:
+        media_type = items[0]["media_type"]
+        sender = send_map.get(media_type)
+        if sender is None:
+            return False, []
+        msg = await sender(
+            chat_id=chat_id,
+            **{media_type: items[0]["file_id"]},
+            caption=caption,
+            protect_content=protect_content,
+        )
+        sent_message_ids.append(msg.message_id)
+        return True, sent_message_ids
+
+    # Lebih dari 1 media -> kirim sebagai album (media group), dipecah
+    # 10-10 karena Telegram membatasi maks 10 item per pesan send_media_group
+    # (jadi 200-300 media otomatis jadi 20-30 pesan album berturutan).
+    # Catatan: Telegram cuma izinkan photo/video/document dicampur dalam 1
+    # media group, "animation" (GIF) tidak bisa ikut di sana.
+    media_input_map = {
+        "photo": InputMediaPhoto,
+        "video": InputMediaVideo,
+        "document": InputMediaDocument,
+    }
+    GROUP_CHUNK_SIZE = 10
+    DELAY_BETWEEN_CHUNKS = 1.5  # detik; jaga-jaga supaya tidak kena flood limit Telegram
+
+    if all(item["media_type"] in media_input_map for item in items):
+        chunks = [items[i:i + GROUP_CHUNK_SIZE] for i in range(0, len(items), GROUP_CHUNK_SIZE)]
+        # send_media_group butuh minimal 2 item per pesan -- kalau potongan
+        # terakhir cuma nyisa 1 (misal total 11, 21, dst.), "pinjam" 1 item
+        # dari potongan sebelumnya (jadi 9 + 2) supaya tidak ada chunk
+        # ber-isi 1 ataupun yang kelebihan dari 10.
+        if len(chunks) > 1 and len(chunks[-1]) == 1:
+            chunks[-1].insert(0, chunks[-2].pop())
+
+        for chunk_idx, chunk in enumerate(chunks):
+            media_group = [
+                media_input_map[item["media_type"]](
+                    media=item["file_id"],
+                    # Caption cuma boleh nempel di 1 item -- taruh di item
+                    # pertama dari chunk pertama saja supaya tidak berulang
+                    # di tiap potongan album.
+                    caption=caption if (chunk_idx == 0 and i == 0) else None,
+                )
+                for i, item in enumerate(chunk)
+            ]
+            messages = await send_media_group_with_retry(
+                context, chat_id, media_group, protect_content=protect_content
+            )
+            sent_message_ids.extend(m.message_id for m in messages)
+            if chunk_idx < len(chunks) - 1:
+                await asyncio.sleep(DELAY_BETWEEN_CHUNKS)
+    else:
+        # Fallback: ada tipe yang tidak didukung media group (misal ada GIF
+        # tercampur) -> kirim satu-satu.
+        for i, item in enumerate(items):
+            sender = send_map.get(item["media_type"])
+            if sender is None:
+                continue
+            msg = await sender(
+                chat_id=chat_id,
+                **{item["media_type"]: item["file_id"]},
+                caption=caption if i == 0 else None,
+                protect_content=protect_content,
+            )
+            sent_message_ids.append(msg.message_id)
+
+    return True, sent_message_ids
+
+
 async def deliver_media(chat_id: int, code: str, context: ContextTypes.DEFAULT_TYPE, requester_id: int) -> bool:
     """Kirim media untuk kode tsb. Return True kalau berhasil ketemu & terkirim.
-    Media diproteksi (protect_content, tidak bisa di-forward/disimpan) dan
-    otomatis dihapus setelah AUTO_DELETE_SECONDS -- KECUALI kalau yang minta
+    Proteksi forward/simpan diatur PROTECT_CONTENT (sekarang False = boleh
+    forward & simpan). Media otomatis dihapus setelah AUTO_DELETE_SECONDS -- KECUALI kalau yang minta
     adalah admin (mis. lagi mendata/cek isi media, medianya tidak boleh
     hilang sendiri)."""
     row = await db.get_media(code)
@@ -700,90 +845,16 @@ async def deliver_media(chat_id: int, code: str, context: ContextTypes.DEFAULT_T
         return False
 
     items, caption = row["items"], row["caption"]
-    sent_message_ids: list[int] = []
     # Admin selalu bebas proteksi. Selain admin, proteksi dilewati kalau
     # sedang di jendela waktu bebas (20:00-21:00 WIB) -- tapi auto-hapus
     # 2 jam tetap jalan terlepas dari jendela ini.
     protect = PROTECT_CONTENT and not is_admin(requester_id) and not is_in_unlock_window()
     skip_notice = is_admin(requester_id)
 
-    send_map = {
-        "photo": context.bot.send_photo,
-        "video": context.bot.send_video,
-        "document": context.bot.send_document,
-        "animation": context.bot.send_animation,
-    }
-
-    # 1 media -> kirim seperti biasa.
-    if len(items) == 1:
-        media_type = items[0]["media_type"]
-        sender = send_map.get(media_type)
-        if sender is None:
-            await context.bot.send_message(chat_id, "Tipe media tidak didukung.")
-            return False
-        msg = await sender(
-            chat_id=chat_id,
-            **{media_type: items[0]["file_id"]},
-            caption=caption,
-            protect_content=protect,
-        )
-        sent_message_ids.append(msg.message_id)
-
-    else:
-        # Lebih dari 1 media -> kirim sebagai album (media group), dipecah
-        # 10-10 karena Telegram membatasi maks 10 item per pesan send_media_group
-        # (jadi 200-300 media otomatis jadi 20-30 pesan album berturutan).
-        # Catatan: Telegram cuma izinkan photo/video/document dicampur dalam 1
-        # media group, "animation" (GIF) tidak bisa ikut di sana.
-        media_input_map = {
-            "photo": InputMediaPhoto,
-            "video": InputMediaVideo,
-            "document": InputMediaDocument,
-        }
-        GROUP_CHUNK_SIZE = 10
-        DELAY_BETWEEN_CHUNKS = 1.5  # detik; jaga-jaga supaya tidak kena flood limit Telegram
-
-        if all(item["media_type"] in media_input_map for item in items):
-            chunks = [items[i:i + GROUP_CHUNK_SIZE] for i in range(0, len(items), GROUP_CHUNK_SIZE)]
-            # send_media_group butuh minimal 2 item per pesan -- kalau potongan
-            # terakhir cuma nyisa 1 (misal total 11, 21, dst.), "pinjam" 1 item
-            # dari potongan sebelumnya (jadi 9 + 2) supaya tidak ada chunk
-            # ber-isi 1 ataupun yang kelebihan dari 10.
-            if len(chunks) > 1 and len(chunks[-1]) == 1:
-                chunks[-1].insert(0, chunks[-2].pop())
-
-            for chunk_idx, chunk in enumerate(chunks):
-                media_group = [
-                    media_input_map[item["media_type"]](
-                        media=item["file_id"],
-                        # Caption cuma boleh nempel di 1 item -- taruh di item
-                        # pertama dari chunk pertama saja supaya tidak berulang
-                        # di tiap potongan album.
-                        caption=caption if (chunk_idx == 0 and i == 0) else None,
-                    )
-                    for i, item in enumerate(chunk)
-                ]
-                messages = await send_media_group_with_retry(
-                    context, chat_id, media_group, protect_content=protect
-                )
-                sent_message_ids.extend(m.message_id for m in messages)
-                if chunk_idx < len(chunks) - 1:
-                    await asyncio.sleep(DELAY_BETWEEN_CHUNKS)
-
-        else:
-            # Fallback: ada tipe yang tidak didukung media group (misal ada GIF
-            # tercampur) -> kirim satu-satu.
-            for i, item in enumerate(items):
-                sender = send_map.get(item["media_type"])
-                if sender is None:
-                    continue
-                msg = await sender(
-                    chat_id=chat_id,
-                    **{item["media_type"]: item["file_id"]},
-                    caption=caption if i == 0 else None,
-                    protect_content=protect,
-                )
-                sent_message_ids.append(msg.message_id)
+    ok, sent_message_ids = await _send_media_items(context, chat_id, items, caption, protect_content=protect)
+    if not ok:
+        await context.bot.send_message(chat_id, "Tipe media tidak didukung.")
+        return False
 
     if sent_message_ids and not skip_notice:
         jam = AUTO_DELETE_SECONDS / 3600
@@ -794,11 +865,10 @@ async def deliver_media(chat_id: int, code: str, context: ContextTypes.DEFAULT_T
                 "di-forward/disimpan. Tonton sekarang selagi masih ada ya."
             )
         else:
-            # Sedang di jendela bebas (20:00-21:00 WIB) -> boleh forward/simpan,
-            # tapi auto-hapus tetap jalan.
+            # Tanpa proteksi -> boleh forward/simpan, tapi auto-hapus tetap jalan.
             notice_text = (
-                f"⏳ Media di atas otomatis terhapus dalam {jam_str} jam. Lagi jendela "
-                "bebas forward/simpan sekarang, jadi silakan disimpan kalau perlu."
+                f"⏳ Media di atas otomatis terhapus dalam {jam_str} jam. Kamu boleh "
+                "forward atau simpan sekarang kalau perlu, sebelum medianya hilang."
             )
         notice = await context.bot.send_message(chat_id, notice_text)
         schedule_auto_delete(context, chat_id, sent_message_ids)
@@ -920,7 +990,7 @@ async def store(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Tipe media tidak didukung (gunakan foto/video/dokumen/gif).")
         return
 
-    await db.save_media(code, items, caption)
+    await save_media_and_vault(context, code, items, caption)
 
     bot_username = (await context.bot.get_me()).username
     deep_link = f"https://t.me/{bot_username}?start=get_{code}"
@@ -964,7 +1034,7 @@ async def postlink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         items, cap = get_replied_media_items(replied, context)
         if items:
             caption = cap
-            await db.save_media(code, items, caption)
+            await save_media_and_vault(context, code, items, caption)
 
     if await db.get_media(code) is None:
         await update.message.reply_text(
@@ -1786,7 +1856,11 @@ async def setvars(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "  Contoh:\n"
             '  /setvars REQUIRED_CHATS [{"chat_id": -1001111111111, '
             '"username": "namachannel", "invite_link": null, '
-            '"label": "📢 Join Channel Utama"}]'
+            '"label": "📢 Join Channel Utama"}]\n\n'
+            "• VAULT_CHAT_ID — chat_id channel/grup brankas backup media "
+            "(lihat /vaultsync). Bot harus jadi admin di situ.\n"
+            "  Contoh:\n"
+            "  /setvars VAULT_CHAT_ID -1001112223334"
         )
         return
 
@@ -1815,6 +1889,8 @@ async def setvars(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             parsed = json.loads(value)
             if not isinstance(parsed, list):
                 raise ValueError("harus berupa list JSON")
+        elif key == "VAULT_CHAT_ID":
+            int(value)  # validasi aja, value disimpan apa adanya (bukan JSON)
     except Exception as e:  # noqa: BLE001
         await update.message.reply_text(f"❌ Format value salah: {e}")
         return
@@ -1862,10 +1938,73 @@ async def getvars(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if key in settings:
             lines.append(f"• {key} (diset via /setvars):\n{settings[key]}\n")
         else:
-            default_val = TARGET_CHATS if key == "TARGET_CHATS" else REQUIRED_CHATS
+            default_val = {
+                "TARGET_CHATS": TARGET_CHATS,
+                "REQUIRED_CHATS": REQUIRED_CHATS,
+                "VAULT_CHAT_ID": VAULT_CHAT_ID,
+            }[key]
             lines.append(f"• {key} (default dari Railway Variables):\n{default_val}\n")
 
     await update.message.reply_text("\n".join(lines))
+
+
+# ---------------------------------------------------------------------
+# /vaultsync -> backup semua kode media yang BELUM pernah di-forward ke
+# VAULT_CHAT_ID (baik backlog lama, atau kode baru yang gagal ke-forward
+# otomatis pas disimpan). Aman dijalankan berkali-kali -- yang sudah
+# tersinkron (vault_synced_at terisi) otomatis di-skip.
+# ---------------------------------------------------------------------
+async def vaultsync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Perintah ini khusus admin.")
+        return
+
+    vault_chat_id = await get_vault_chat_id()
+    if not vault_chat_id:
+        await update.message.reply_text(
+            "⚠️ VAULT_CHAT_ID belum di-set. Isi dulu lewat:\n"
+            "/setvars VAULT_CHAT_ID <chat_id>\n\n"
+            "(chat_id channel/grup brankas, bot harus sudah jadi admin di situ)"
+        )
+        return
+
+    pending = await db.get_unsynced_media()
+    if not pending:
+        await update.message.reply_text("✅ Semua kode media sudah tersinkron ke brankas. Tidak ada yang perlu di-backup.")
+        return
+
+    status_msg = await update.message.reply_text(
+        f"⏳ Mulai backup {len(pending)} kode ke brankas. Ini bisa makan waktu "
+        f"beberapa menit kalau jumlahnya banyak, sabar ya..."
+    )
+
+    ok, failed = 0, 0
+    DELAY_BETWEEN_CODES = 1.0  # detik; jaga-jaga flood limit di luar yg sudah di-handle per-album
+    for i, row in enumerate(pending):
+        success = await vault_backup_code(context, row["code"], row["items"], row["caption"])
+        if success:
+            await db.mark_media_vault_synced(row["code"])
+            ok += 1
+        else:
+            failed += 1
+
+        # Update status tiap 10 kode biar admin tau progressnya, bukan diam total.
+        if (i + 1) % 10 == 0 or (i + 1) == len(pending):
+            try:
+                await status_msg.edit_text(
+                    f"⏳ Progres: {i + 1}/{len(pending)} kode diproses "
+                    f"(✅ {ok} sukses, ❌ {failed} gagal)..."
+                )
+            except TelegramError:
+                pass
+        await asyncio.sleep(DELAY_BETWEEN_CODES)
+
+    await update.message.reply_text(
+        f"✅ Vault sync selesai. {ok} kode berhasil di-backup, {failed} gagal "
+        f"(kode yang gagal TIDAK ditandai tersinkron, akan dicoba lagi di "
+        f"/vaultsync berikutnya)."
+    )
 
 
 # ---------------------------------------------------------------------
@@ -1983,6 +2122,7 @@ def main() -> None:
     app.add_handler(CommandHandler(["setvars", "sv"], setvars))
     app.add_handler(CommandHandler(["delvars", "dv"], delvars))
     app.add_handler(CommandHandler(["getvars", "gv"], getvars))
+    app.add_handler(CommandHandler(["vaultsync"], vaultsync))
     app.add_handler(CallbackQueryHandler(check_join_callback, pattern=r"^checkjoin_"))
     app.add_handler(CallbackQueryHandler(listmedia_callback, pattern=r"^listmedia_"))
     app.add_error_handler(global_error_handler)
