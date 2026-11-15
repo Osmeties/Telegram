@@ -465,3 +465,14 @@ async def mark_media_vault_synced(code: str) -> None:
 async def count_unsynced_media() -> int:
     async with _pool.acquire() as conn:
         return await conn.fetchval("SELECT COUNT(*) FROM media WHERE vault_synced_at IS NULL")
+
+
+async def reset_vault_synced() -> int:
+    """Tandai SEMUA kode sebagai belum ter-backup (vault_synced_at = NULL),
+    supaya /vaultsync mengirim ulang semuanya -- dipakai kalau pindah ke
+    grup brankas baru. Return jumlah baris yang direset."""
+    async with _pool.acquire() as conn:
+        result = await conn.execute(
+            "UPDATE media SET vault_synced_at = NULL WHERE vault_synced_at IS NOT NULL"
+        )
+        return int(result.split()[-1])
