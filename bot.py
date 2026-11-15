@@ -59,7 +59,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ParseMode
-from telegram.error import RetryAfter, TelegramError
+from telegram.error import ChatMigrated, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -142,17 +142,33 @@ async def vault_backup_code(
     didahului 1 pesan penanda biar kelihatan kode apa pas dibuka manual nanti.
     Return False kalau VAULT_CHAT_ID belum di-set atau pengiriman gagal
     (ditelan di sini -- backup gagal tidak boleh sampai gagalkan proses
-    simpan media yang utama)."""
+    simpan media yang utama; alasan gagalnya dicatat di bot_data["vault_last_error"]).
+
+    Dua error yang ditangani otomatis:
+    - ChatMigrated: grup biasa di-upgrade jadi supergrup -> chat_id berubah.
+      ID baru disimpan ke setting VAULT_CHAT_ID lalu dicoba lagi.
+    - RetryAfter: kena flood limit Telegram -> tunggu sesuai arahan, coba lagi."""
     vault_chat_id = await get_vault_chat_id()
     if not vault_chat_id:
         return False
-    try:
-        await context.bot.send_message(vault_chat_id, f"📦 KODE: {code} ({len(items)} item)")
-        ok, _ = await _send_media_items(context, vault_chat_id, items, caption)
-        return ok
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Gagal vault-backup kode %s: %s", code, e)
-        return False
+
+    for _ in range(6):
+        try:
+            await context.bot.send_message(vault_chat_id, f"📦 KODE: {code} ({len(items)} item)")
+            ok, _ids = await _send_media_items(context, vault_chat_id, items, caption)
+            return ok
+        except ChatMigrated as e:
+            vault_chat_id = e.new_chat_id
+            await db.set_setting("VAULT_CHAT_ID", str(vault_chat_id))
+            logger.warning("Brankas pindah jadi supergrup, VAULT_CHAT_ID diperbarui ke %s", vault_chat_id)
+        except RetryAfter as e:
+            await asyncio.sleep(float(e.retry_after) + 1)
+        except Exception as e:  # noqa: BLE001
+            context.bot_data["vault_last_error"] = str(e)
+            logger.warning("Gagal vault-backup kode %s: %s", code, e)
+            return False
+    context.bot_data["vault_last_error"] = "terlalu banyak percobaan ulang (flood limit / chat pindah)"
+    return False
 
 
 async def save_media_and_vault(
@@ -1969,6 +1985,7 @@ async def vaultsync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    context.bot_data.pop("vault_last_error", None)
     pending = await db.get_unsynced_media()
     if not pending:
         await update.message.reply_text("✅ Semua kode media sudah tersinkron ke brankas. Tidak ada yang perlu di-backup.")
@@ -1980,7 +1997,7 @@ async def vaultsync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
     ok, failed = 0, 0
-    DELAY_BETWEEN_CODES = 1.0  # detik; jaga-jaga flood limit di luar yg sudah di-handle per-album
+    DELAY_BETWEEN_CODES = 2.0  # detik; jaga-jaga flood limit di luar yg sudah di-handle per-album
     for i, row in enumerate(pending):
         success = await vault_backup_code(context, row["code"], row["items"], row["caption"])
         if success:
@@ -2004,6 +2021,8 @@ async def vaultsync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"✅ Vault sync selesai. {ok} kode berhasil di-backup, {failed} gagal "
         f"(kode yang gagal TIDAK ditandai tersinkron, akan dicoba lagi di "
         f"/vaultsync berikutnya)."
+        + (f"\n\nAlasan gagal terakhir: {context.bot_data['vault_last_error']}"
+           if failed and context.bot_data.get("vault_last_error") else "")
     )
 
 
