@@ -272,6 +272,52 @@ Ini butuh `TARGET_CHATS` sudah dimigrasi ke format `kind` (lihat bagian
 di-set, entri itu otomatis di-skip oleh `/tempch`/`/tempgrp` (tidak dianggap
 channel maupun grup).
 
+### Backup media ke channel brankas (jaga-jaga bot kena ban)
+`file_id` Telegram terikat ke bot yang pertama kali upload — kalau bot ini
+suatu saat kena ban, semua `file_id` yang tersimpan di database jadi **mati
+permanen**, walau database-nya sendiri aman-aman saja. Fitur ini jaga-jaga
+itu: tiap media yang disimpan di-forward juga salinannya ke 1 channel/grup
+privat ("brankas") yang histori chat-nya disimpan Telegram sendiri (bukan
+bot) — jadi kalau bot kena ban, kamu masih bisa buka brankas itu manual
+(pakai akun kamu sendiri, bukan bot) dan upload ulang ke bot baru.
+
+**Setup sekali di awal:**
+1. Bikin 1 channel/grup **privat** khusus buat ini (jangan dicampur sama
+   `TARGET_CHATS` yang isinya promosi ke user).
+2. Jadiin bot admin di situ, dan pastikan akun kamu sendiri juga jadi
+   member/admin di situ (bukan cuma bot) — ini kuncinya, supaya tetap bisa
+   diakses walau bot kena ban.
+3. Set chat_id-nya:
+   ```
+   /setvars VAULT_CHAT_ID -1001112223334
+   ```
+
+Setelah itu, **tiap media baru** yang disimpan lewat `/genlink`, `/store`,
+`/batchdone`, atau `/postlink` otomatis ke-forward juga ke brankas —
+didahului 1 pesan penanda `📦 KODE: <kode> (<jumlah item> item)` biar
+gampang dicari pas dibuka manual nanti. Kalau jumlah item dalam 1 kode
+lebih dari 1, dikirim sebagai album (dipecah 10-10 kalau lebih dari 10,
+sama persis seperti pengiriman ke user yang klik deep-link).
+
+**Buat backlog media yang udah ada SEBELUM VAULT_CHAT_ID di-set** (atau
+yang gagal ke-forward otomatis karena error jaringan dll), jalankan:
+```
+/vaultsync
+```
+Ini nyapu semua kode yang belum pernah ke-backup, kirim ke brankas satu-satu
+dengan jeda (biar tidak kena flood limit Telegram) sambil ngasih laporan
+progres tiap 10 kode. Aman dijalankan berkali-kali — kode yang sudah
+tersinkron otomatis di-skip, cuma yang belum/gagal yang diproses ulang.
+
+**Pindah ke grup brankas baru?** Mengganti `VAULT_CHAT_ID` saja tidak
+mengirim ulang backup lama, karena semua kode lama sudah bertanda
+"tersinkron". Urutannya:
+1. `/setvars VAULT_CHAT_ID <chat_id_grup_baru>` (cek lewat `/getvars`).
+2. `/vaultreset` -- tampil ringkasan dan minta konfirmasi, lalu
+   `/vaultreset ya` untuk benar-benar mereset tandanya.
+3. `/vaultsync` -- kirim ulang semua kode ke grup baru (lama, sama seperti
+   backup pertama). Isi grup lama tidak terhapus.
+
 ### Mengatur TARGET_CHATS / REQUIRED_CHATS langsung dari chat
 Gak perlu lagi bolak-balik ke Railway Variables setiap mau ganti channel
 tujuan broadcast atau channel wajib-join — admin bisa atur langsung:
@@ -302,8 +348,8 @@ Saat user ketik `/` di chat bot, menu yang muncul otomatis berbeda:
   `/store`, `/postlink`, `/thumbch`, `/thumbgrp`, `/link`, `/batchstart`,
   `/batchstatus`, `/batchdone`, `/batchcancel`, `/delmedia`, `/listmedia`,
   `/cari`, `/broadcast`, `/temp`, `/tempch`, `/tempgrp`, `/setvars`,
-  `/delvars`, `/getvars`, `/jadwal`, `/jadwallist`, `/jadwalbatal`,
-  `/ping`, `/start`.
+  `/delvars`, `/getvars`, `/jadwal`, `/jdtemp`, `/jdtempch`, `/jdtempgrp`,
+  `/jadwallist`, `/jadwalbatal`, `/vaultsync`, `/vaultreset`, `/ping`, `/start`.
 
 Ini murni soal tampilan menu supaya rapi — semua command admin **tetap**
 dicek lewat `is_admin()` di kode, jadi member yang tahu nama command-nya
@@ -411,6 +457,27 @@ Mau thumbnail beda channel/grup buat jadwal ini juga? Jalankan
 `/thumbch`/`/thumbgrp` (reply foto) **sebelum** `/jadwal`-nya, persis seperti
 `/broadcast` biasa (lihat bagian "Thumbnail beda untuk channel & grup" di
 atas) — thumbnail-nya ikut tersimpan bareng jadwalnya sampai waktunya tiba.
+
+Mau jadwal ini bersifat **sementara** (otomatis terhapus jam 02:00 WIB
+setelah dikirim, kayak `/temp`)? Pakai `/jdtemp` sebagai ganti `/jadwal` —
+formatnya sama persis:
+```
+/jdtemp 30-08-2026 20:00
+Judul Film
+
+▶️ Putar Video | https://t.me/NamaBot?start=get_KODE
+```
+Jadwal ini **tidak mengganggu jadwal hapus** jam 02:00: jadwal cuma
+nentuin KAPAN postingannya dikirim, baru SETELAH beneran terkirim
+pesannya dicatat buat dihapus di jam 02:00 WIB berikutnya — persis
+seperti `/temp` biasa (kalau dikirim lewat jam 02:00, nunggu sampai
+02:00 di hari berikutnya).
+
+Mau sekalian dibatasi tujuannya? Ada juga:
+```
+/jdtempch   -> jadwal sementara, cuma ke TARGET_CHATS yang kind="channel"
+/jdtempgrp  -> jadwal sementara, cuma ke TARGET_CHATS yang kind="group"
+```
 
 Lihat semua jadwal yang belum jalan:
 ```
