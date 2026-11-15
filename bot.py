@@ -104,6 +104,7 @@ ADMIN_COMMANDS = PUBLIC_COMMANDS + [
     BotCommand("delvars", "Untuk menghapus variabel"),
     BotCommand("getvars", "Untuk mendapatkan daftar variabel"),
     BotCommand("vaultsync", "Backup semua media yang belum ter-sync ke channel brankas"),
+    BotCommand("vaultreset", "Reset tanda backup supaya vaultsync kirim ulang semua (pindah grup)"),
     BotCommand("broadcast", "Untuk mengirimkan pesan ke channel/grup"),
     BotCommand("temp", "Posting sementara, otomatis terhapus tiap jam 02:00 WIB"),
     BotCommand("tempch", "Sama seperti /temp, tapi cuma ke channel (kind=channel)"),
@@ -2027,6 +2028,46 @@ async def vaultsync(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------
+# /vaultreset -> tandai SEMUA kode sebagai "belum ter-backup" supaya
+# /vaultsync berikutnya mengirim ulang semuanya ke VAULT_CHAT_ID yang aktif.
+# Dipakai saat pindah ke grup brankas baru. Perlu konfirmasi "ya" karena
+# efeknya kirim ulang semua kode (berat & lama, sama seperti backup pertama).
+# ---------------------------------------------------------------------
+async def vaultreset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Perintah ini khusus admin.")
+        return
+
+    vault_chat_id = await get_vault_chat_id()
+    if not vault_chat_id:
+        await update.message.reply_text(
+            "⚠️ VAULT_CHAT_ID belum di-set. Set grup brankas barunya dulu:\n"
+            "/setvars VAULT_CHAT_ID <chat_id>"
+        )
+        return
+
+    if not context.args or context.args[0].lower() != "ya":
+        total = await db.count_media()
+        unsynced = await db.count_unsynced_media()
+        await update.message.reply_text(
+            f"⚠️ Ini akan menandai SEMUA {total} kode sebagai belum ter-backup "
+            f"({total - unsynced} di antaranya sudah ter-backup sekarang), lalu "
+            f"/vaultsync akan mengirim ulang semuanya ke:\n{vault_chat_id}\n\n"
+            "Pastikan angka di atas adalah grup brankas BARU (cek juga lewat "
+            "/getvars). Kalau masih grup lama, backup ulangnya masuk ke grup lama lagi.\n\n"
+            "Kalau sudah yakin, ketik:\n/vaultreset ya"
+        )
+        return
+
+    n = await db.reset_vault_synced()
+    await update.message.reply_text(
+        f"✅ {n} kode ditandai belum ter-backup.\n"
+        f"Jalankan /vaultsync sekarang untuk mengirim ulang semuanya ke {vault_chat_id}."
+    )
+
+
+# ---------------------------------------------------------------------
 # /ping  -> cek bot hidup + latency
 # ---------------------------------------------------------------------
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2142,6 +2183,7 @@ def main() -> None:
     app.add_handler(CommandHandler(["delvars", "dv"], delvars))
     app.add_handler(CommandHandler(["getvars", "gv"], getvars))
     app.add_handler(CommandHandler(["vaultsync"], vaultsync))
+    app.add_handler(CommandHandler(["vaultreset"], vaultreset))
     app.add_handler(CallbackQueryHandler(check_join_callback, pattern=r"^checkjoin_"))
     app.add_handler(CallbackQueryHandler(listmedia_callback, pattern=r"^listmedia_"))
     app.add_error_handler(global_error_handler)
